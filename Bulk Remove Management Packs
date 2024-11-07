@@ -1,0 +1,29 @@
+# Load the Operations Manager module
+Import-Module OperationsManager
+
+# Retrieve all management packs
+$managementPacks = Get-SCOMManagementPack
+
+# Filter for installed management packs (using Sealed property)
+$installedManagementPacks = $managementPacks | Where-Object { $_.Sealed -eq $true }
+
+# Loop through each management pack and remove it
+foreach ($mp in $installedManagementPacks) {
+    try {
+        Write-Host "Removing management pack: $($mp.DisplayName) - $($mp.Name)"
+        # Remove the management pack without confirmation
+        Remove-SCOMManagementPack -ManagementPack $mp -Confirm:$false
+        Write-Host "Successfully removed management pack: $($mp.DisplayName) - $($mp.Name)"
+    } catch {
+        Write-Host "Failed to remove management pack: $($mp.DisplayName) - $($mp.Name) - $_"
+    }
+}
+
+# Optionally, output the remaining management packs
+$remainingManagementPacks = Get-SCOMManagementPack | Where-Object { $_.Sealed -eq $true }
+if ($remainingManagementPacks.Count -eq 0) {
+    Write-Host "All management packs have been removed."
+} else {
+    Write-Host "Remaining management packs:"
+    $remainingManagementPacks | ForEach-Object { Write-Host "$($_.DisplayName) - $($_.Name)" }
+}
