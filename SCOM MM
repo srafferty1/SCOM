@@ -1,0 +1,3823 @@
+<#
+.SYNOPSIS
+    Suppresses heartbeat alerting for SCOM agents that have been gracefully
+    shut down (Event ID 1074), for as long as they stay down.
+
+.DESCRIPTION
+    Runs on a management server. Nothing is installed on the agents.
+    Built for a large management group (~3500 agents) where 60-400 machines
+    may be gracefully down at once, for days or weeks at a time.
+
+    DESIGN
+      Maintenance mode is applied in a BOUNDED window and rolled forward while
+      the machine stays down, rather than set once for a long period. If this
+      script stops running, machines surface as normal heartbeat alerts within
+      MaintenanceHours instead of staying invisible indefinitely.
+
+      Machines currently suppressed are tracked in a local state file, so no
+      pass ever enumerates the Windows Computer class. Cost is proportional to
+      the number of machines actually down, not to the size of the group.
+
+    THREE SCHEDULED TASKS
+      APPLY - every 5 minutes. Loops internally so a pass runs every 60s.
+        powershell.exe -NonInteractive -ExecutionPolicy Bypass ^
+          -File "D:\Scripts\Set-ScomShutdownMaintenanceMode.ps1" ^
+          -LoopIntervalSeconds 60 -LoopBudgetSeconds 240 -LockTimeoutSeconds 20
+
+      SWEEP - every 15 minutes. Releases machines that are back, extends MM
+              for those still down, reapplies lapsed MM, records events.
+        powershell.exe -NonInteractive -ExecutionPolicy Bypass ^
+          -File "D:\Scripts\Set-ScomShutdownMaintenanceMode.ps1" -Sweep
+
+      DIGEST - weekly. Emails the dormant-machine review and the suppression
+               summary, and prunes the event history.
+        powershell.exe -NonInteractive -ExecutionPolicy Bypass ^
+          -File "D:\Scripts\Set-ScomShutdownMaintenanceMode.ps1" -Digest
+
+    All three take a machine-wide mutex per pass, so they cannot overlap and
+    clobber each other's view of the state file. The mutex is held for the
+    duration of the WORK, not the process - under the APPLY loop, holding it
+    for the whole invocation would starve SWEEP out completely.
+
+    The internal loop is APPLY-only. SWEEP, DIGEST, CHANGE and -DryRun always
+    run a single pass and ignore -LoopIntervalSeconds, so it is safe to set
+    LoopIntervalSeconds as the parameter default instead of on the APPLY
+    command line. When the loop is on and -LockTimeoutSeconds is not given, the
+    lock timeout drops to a third of the interval (20s at 60s).
+
+    EXCLUSIONS
+      Machines named in -ExclusionFile are never put into maintenance mode by
+      any mode of this script - management servers above all. One entry per
+      line, '#' starts a comment, wildcards * and ? allowed. Each entry is
+      matched, case-insensitively, against the FQDN and the short host name:
+
+          SCOMMS01                    one server, by short name
+          scomgw01.contoso.com        one server, by FQDN
+          ???????MGT????              every server with role code MGT
+
+        APPLY  - an excluded machine's shutdown alert is left OPEN, so the
+                 shutdown is visible in the console. Not tracked.
+        SWEEP  - a machine added to the list after it was suppressed is taken
+                 out of this script's window (up or down) and dropped from
+                 tracking. Someone else's window is left alone.
+        CHANGE - excluded CIs are left out of change windows. A window that has
+                 already started is never touched, so remove one by hand.
+
+      The file is re-read whenever it changes, so edits apply on the next pass.
+      No file = nothing excluded (logged). A file that exists but cannot be
+      read reuses the last good copy; with no good copy the pass is skipped
+      rather than risk putting an excluded machine into maintenance mode.
+
+    LATENCY
+      Heartbeat at 6 x 60s gives roughly a 6-minute budget from last heartbeat
+      to a heartbeat failure alert. A 5-minute task with 60-second internal
+      iterations puts worst-case alert-to-maintenance-mode at about 90 seconds.
+      Task Scheduler repetition intervals are not used at all.
+
+    AGENT LIVENESS
+      Release is confirmed by a TCP connect to the agent channel port (5723).
+      That single round trip proves the machine is up AND that HealthService is
+      listening - no RPC, no local admin on 3500 agents, and immune to the
+      DHCP-address-reuse false positive that plain ping has.
+
+      A probe wave costs ONE PingTimeoutMs plus ONE TcpTimeoutMs, not one per
+      machine: every probe is started before anything is waited on, and the
+      harvest loop runs against a single deadline per protocol. This matters
+      more here than it looks. ConnectAsync has no timeout of its own, so a
+      switched-off host on a network that does not answer with ICMP unreachable
+      sits in SYN retransmit for ~21s - and switched-off hosts are this
+      script's entire tracked population.
+
+    OTHER PEOPLE'S MAINTENANCE WINDOWS
+      Before extending or releasing anything, the sweep asks who set the window
+      it is looking at, by reading $Marker back out of the window comment. A
+      window this script did not set is left strictly alone: not extended, not
+      released, and if the machine comes back it is dropped from tracking with
+      the window still in place rather than being pulled out of it. A machine
+      still down when a foreign window lapses is picked up again by the normal
+      reapply path, which is why hands-off machines stay tracked.
+
+      If window comments cannot be read on your SDK build, ownership comes back
+      Unknown and every window is treated as this script's own - behaviour is
+      then exactly what it was before ownership existed. That direction is
+      deliberate: treating unreadable as foreign would stop the script
+      extending or releasing anything at all, and the tracked population would
+      climb to TrackedCeiling with the estate blind behind it.
+
+      A BLANK comment is foreign once any window has proved comments are
+      readable (every window this script sets carries the marker); before that
+      proof it is Unknown. Either way it no longer switches ownership off for
+      the whole run, which it used to do if it was the first window read.
+
+    STATE LOSS AND RECOVERY
+      Set-TrackedState writes through a temporary file and swaps it in with
+      File.Replace, which leaves the previous generation at <state>.bak. If the
+      primary is ever missing or unparseable, the next pass rebuilds from that
+      backup, restores the primary, and emails the recovery notice - at most one
+      pass of changes is lost, and the next sweep re-derives those from SCOM. A
+      corrupt primary is kept at <state>.corrupt rather than being overwritten.
+      Only when the backup is missing, empty or unreadable as well does this
+      become the StateLoss emergency: machines suppressed, untracked, and
+      invisible until their windows expire.
+
+    DRY RUN
+      -DryRun queries alerts, resolves computers, probes agents and works out
+      ownership, prints the plan, and stops. No maintenance mode, no alert
+      resolution states, no state files, no mail, and deliberately no watchdog event
+      - the watchdog rule fires on the ABSENCE of those, so a dry run emitting
+      one would falsely report that a script which changed nothing was working.
+      Single-pass: -LoopIntervalSeconds is ignored so a task command line can be
+      pasted verbatim with -DryRun appended. Exits 0.
+
+        powershell.exe -NonInteractive -ExecutionPolicy Bypass ^
+          -File "D:\Scripts\Shutdown.ps1" -Sweep -DryRun
+
+    NOTIFICATIONS
+      Mail is OFF unless -SmtpServer, -MailFrom and -MailTo are all supplied.
+      The script emails only where email is genuinely the right channel:
+        - a systemic fault that looks like success from the outside
+          (runaway suppression, maintenance mode failing wholesale, state loss)
+        - the weekly digests, which go to people who do not live in the console
+      Everything else is a Windows event for a SCOM rule to pick up. Notice
+      that "the script stopped running" is deliberately NOT an email - a dead
+      script cannot send one. That is what the watchdog events below are for.
+
+    WATCHDOG EVENTS  (Application log, source $EventSource, one per invocation)
+                  done, clean    done, with errors   did no work
+        APPLY       9100 Info       9101 Warning       9102 Error
+        SWEEP       9110 Info       9111 Warning       9112 Error
+        DIGEST      9120 Info       9121 Warning       9122 Error
+        CHANGE      9130 Info       9131 Warning       9132 Error
+
+      "Did no work" = the SCOM module did not load, the management group could
+      not be reached, or every pass threw. It used to be reported as success
+      when the lock was never won.
+
+      An invocation where every iteration DEFERRED to the other task holding the
+      mutex is reported as x101 (warning), NOT x102. A sweep that holds the lock
+      for longer than the whole APPLY budget is a busy management server, not a
+      broken script, and x102 there fires the did-no-work rule on a system where
+      nothing is wrong. The message names the cause and gives the skip count.
+      x103 is unused if you would rather alert on it separately - add it to the
+      Missing Event monitor as well if you split it out.
+
+      Each mode has its own IDs so each task can be watched on its own: a SCOM
+      Missing Event monitor per task, on x100 OR x101, over about three times
+      that task's schedule. With a shared ID the 5-minute APPLY task kept the
+      watchdog satisfied while SWEEP was not running at all. A task that dies
+      before it can log anything (a bad parameter, say) writes nothing, which
+      is exactly what the Missing Event monitor catches. A simple alert rule
+      on x102 says WHY, straight away.
+
+    SDK SURFACE - the part that is easy to get wrong
+      Start   Start-SCOMMaintenanceMode -Instance <MonitoringObject[]> -EndTime <local>
+              (batched cmdlet; falls back to ScheduleMaintenanceMode per object)
+      Extend  Get-SCOMMaintenanceMode -Instance <MonitoringObject[]>
+                | Set-SCOMMaintenanceMode -MaintenanceModeEntry <MaintenanceWindow[]>
+              (Set-SCOMMaintenanceMode does NOT take -Instance)
+      Stop    $instance.StopMaintenanceMode(<utc>, TraversalDepth::Recursive)
+              There is no Stop-SCOMMaintenanceMode cmdlet. It has never existed.
+      Cmdlets take LOCAL time. SDK methods take UTC. Everything here is computed
+      in UTC and converted only at the cmdlet boundary.
+
+    VERIFY BEFORE TRUSTING AT SCALE
+      1. Start-SCOMMaintenanceMode has no TraversalDepth parameter. Put one
+         machine in MM with it, then confirm in the console that the HEALTH
+         SERVICE object under that Windows Computer is also in maintenance
+         mode - that specifically is what the Health Service Watcher checks
+         before raising heartbeat failure. If it is not, set UseSdkForApply.
+      2. The Windows Computer lookup filters on FullName starting
+         'Microsoft.Windows.Computer:'. Confirm one lookup resolves; there is
+         an empty-Path fallback if your instances are shaped differently.
+      3. Alert.PrincipalName should carry the agent FQDN for your 1074 rule.
+         Log a pass with -Verbose and confirm the FQDNs look right.
+      4. Probe one known-good agent, one down agent, and one machine with
+         HealthService deliberately stopped, and confirm the three outcomes.
+      5. Ownership and window end times both come from GetMaintenanceWindow().
+         Put one machine in maintenance mode BY HAND with a comment of your own,
+         run -Sweep -DryRun, and confirm it reports HANDS-OFF. If the log says
+         ownership cannot be determined, this SDK build does not surface window
+         comments and the feature is inert - safely, but inert.
+
+    Requires the OperationsManager module (Windows PowerShell 5.1 - the module
+    does not load in PowerShell 7).
+
+.NOTES
+    Event source registration needs one elevated run:
+        New-EventLog -LogName Application -Source 'ScomShutdownMM'
+    The script attempts this itself and degrades quietly if it cannot.
+#>
+#Requires -Version 5.1
+[CmdletBinding()]
+param(
+    # Array, so a dead management server fails over to the next rather than
+    # losing the whole invocation.
+    [string[]]$ManagementServer = @('localhost'),
+
+    # Display name of the alert raised by your 1074 rule.
+    [string]$AlertName = 'System Shutdown Event 1074 Alert',
+
+    # Bounded MM window, rolled forward by the sweep while the machine is down.
+    # This is your blast radius if the sweep stops running.
+    [ValidateRange(1, 720)]
+    [int]$MaintenanceHours = 24,
+
+    # Extend MM when its remaining life drops below this. The gap between this
+    # and MaintenanceHours is how many failed sweeps you can absorb.
+    [ValidateRange(1, 719)]
+    [int]$ExtendWhenWithinHours = 8,
+
+    # Apply mode: only consider alerts raised inside this window. Processed
+    # alerts are stamped closed, so the resolution state is the real dedupe -
+    # this window only stops the first run sweeping up ancient history. It can
+    # be generous, and needs to be wider than a burst takes to drain at MaxBatch.
+    [ValidateRange(5, 10080)]
+    [int]$LookbackMinutes = 240,
+
+    # Ceiling on machines entering MM per pass. MM start/stop triggers config
+    # recalculation, so a 390-machine burst is better spread over a few passes.
+    [ValidateRange(1, 1000)]
+    [int]$MaxBatch = 100,
+
+    # Ceiling on machines LEAVING MM per sweep. Monday morning is the mass
+    # event - hundreds returning at once, each an individual SDK stop call.
+    [ValidateRange(1, 1000)]
+    [int]$MaxReleaseBatch = 100,
+
+    # Resolution state stamped on processed alerts. 255 = Closed.
+    [ValidateRange(0, 255)]
+    [int]$ProcessedResolutionState = 255,
+
+    # Sweep mode: release / extend / reapply / record.
+    [switch]$Sweep,
+
+    # Digest mode: weekly report email, and event-history pruning.
+    [switch]$Digest,
+
+    # Machines suppressed longer than this are reported for human review.
+    # Nothing is removed automatically.
+    [ValidateRange(1, 3650)]
+    [int]$ReviewAfterDays = 14,
+
+    [ValidateRange(1, 3650)]
+    [int]$ReportEveryDays = 7,
+
+    [ValidateRange(100, 30000)]
+    [int]$PingTimeoutMs = 2000,
+
+    [ValidateRange(100, 30000)]
+    [int]$DnsTimeoutMs = 3000,
+
+    # ---- Agent liveness probe --------------------------------------------
+    # A successful TCP connect proves the machine is up AND HealthService is
+    # listening, in one round trip.
+    [ValidateRange(1, 65535)]
+    [int]$AgentPort = 5723,
+
+    [ValidateRange(250, 30000)]
+    [int]$TcpTimeoutMs = 3000,
+
+    # Machines probed per DNS/ping/TCP wave. Everything inside a wave is in
+    # flight at once, so a wave costs one slow probe in TIME but holds a socket
+    # and a ping handle per machine while it runs. Caps the fan-out now that the
+    # tracked population can legitimately reach TrackedCeiling.
+    [ValidateRange(10, 2000)]
+    [int]$ProbeBatchSize = 250,
+
+    # Falls back to the ping-streak rule. The old -SkipHealthServiceCheck name
+    # is kept as an alias so existing task command lines do not break.
+    [Alias('SkipHealthServiceCheck')]
+    [switch]$SkipAgentPortCheck,
+
+    # Consecutive pings needed to release when the port probe is disabled.
+    [ValidateRange(1, 20)]
+    [int]$PingStreakForRelease = 2,
+
+    # A machine answering ping but not $AgentPort is normally mid-boot. After
+    # this many consecutive sweeps it is released anyway, so a genuinely broken
+    # agent surfaces as a heartbeat alert instead of sitting in MM forever.
+    # At a 15-minute sweep, 4 = one hour of boot tolerance.
+    # Set very high to restore "stay suppressed until the agent answers".
+    [ValidateRange(1, 9999)]
+    [int]$ReleaseAfterPingOnlySweeps = 4,
+
+    # Do everything except change anything: query alerts, resolve computers,
+    # probe agents, work out ownership, then print the plan and stop. No
+    # maintenance mode, no alert updates, no state files, no mail, and no
+    # watchdog event - a dry run must not satisfy the SCOM rule watching for
+    # the ABSENCE of the x100/x101 events, because it has not done the job.
+    [switch]$DryRun,
+
+    # Use the SDK ScheduleMaintenanceMode (explicit Recursive) instead of the
+    # Start-SCOMMaintenanceMode cmdlet. Slower - one call per machine.
+    [switch]$UseSdkForApply,
+
+    # ---- Verification settling -------------------------------------------
+    # Every MM write is verified by re-reading the instance, because "the call
+    # did not throw" is not proof it took. A read on the SAME TICK as the write
+    # can still see the pre-write state, which then gets logged as a hard MM
+    # failure - and at MmFailureAlertCount of those in one pass, mailed as
+    # "maintenance mode failing wholesale". A Monday-morning batch of a hundred
+    # releases is exactly where that happens. Wait this long before the read
+    # that decides. 0 restores the old same-tick behaviour.
+    [ValidateRange(0, 30000)]
+    [int]$VerifySettleMs = 2000,
+
+    # Anything that still does not read as expected gets ONE more look after
+    # this. Only the stragglers are re-read, so a pass where everything took
+    # cleanly - the normal case - costs nothing at all.
+    [ValidateRange(0, 60000)]
+    [int]$VerifyRetryMs = 5000,
+
+    # ---- Internal loop ----------------------------------------------------
+    # Run a pass every LoopIntervalSeconds until LoopBudgetSeconds has elapsed,
+    # then exit. Lets a 5-minute task deliver 1-minute latency without relying
+    # on Task Scheduler repetition, and pays the module-import and connection
+    # cost once per invocation instead of once per pass.
+    # 0 = single pass. APPLY only: SWEEP, DIGEST, CHANGE and -DryRun ignore it
+    # and run once, so it can safely be hard-coded here as the default.
+    [ValidateRange(0, 300)]
+    [int]$LoopIntervalSeconds = 0,
+
+    # Stop starting new iterations past this. Must leave room for the last pass
+    # to finish before the task fires again: 240 on a 5-minute task leaves ~60s.
+    [ValidateRange(30, 3600)]
+    [int]$LoopBudgetSeconds = 240,
+
+    # ---- CHANGE mode ------------------------------------------------------
+    # Reads approved, CI-impacting changes from the Service Manager database and
+    # creates a SCOM maintenance SCHEDULE per change, so SCOM itself starts the
+    # window at DOWN_START and ends it at PLANNED_END. Nothing is generated and
+    # nothing has to be run at outage time.
+    #
+    # REQUIRES the Operations Manager Administrator role. Maintenance schedules
+    # do; plain maintenance mode does not. The pass fails cleanly and loudly if
+    # the account does not have it.
+    [switch]$Change,
+
+    [string]$ChangeSqlServer = '',
+    [string]$ChangeDatabase  = '',
+
+    # Only CIs whose CI_NAME matches this are considered.
+    [string]$ChangeCiFilter  = 'diep',
+
+    # CMDB CI names are often short. Tried as given first, then with this
+    # appended, because SCOM display names are usually FQDNs.
+    [string]$ChangeDomainSuffix = $env:USERDNSDOMAIN,
+
+    [ValidateRange(1, 365)]
+    [int]$ChangeLookAheadDays = 14,
+
+    [ValidateRange(1, 5000)]
+    [int]$ChangeMaxRows = 200,
+
+    [ValidateRange(1, 1440)]
+    [int]$ChangeMinDurationMinutes = 5,
+
+    # Sanity cap against bad data in PLANNED_END.
+    [ValidateRange(1, 8760)]
+    [int]$ChangeMaxDurationHours = 72,
+
+    # Schedules this script owns are named <prefix><change number>. Anything
+    # not matching the prefix is somebody else's and is never touched.
+    [string]$ChangeSchedulePrefix = 'CHM-',
+
+    # Time zone ActiveStartTime is interpreted in. VERIFY on the first run that
+    # the window lands where you expect.
+    [string]$ChangeTimeZoneId = ([System.TimeZoneInfo]::Local.Id),
+
+    # Remove schedules for changes that are no longer approved and open. Only
+    # ever removes windows that have NOT started, that this script holds state
+    # for, and that have stayed missing for ChangeWithdrawAfterMinutes.
+    [switch]$ChangeReconcile,
+
+    # A change can drop out of the query for a moment - data lag, an approval
+    # state transition, a filter change. One missing observation is not evidence
+    # the change is gone, so a window is only withdrawn after it has stayed
+    # missing this long. 0 withdraws on the first missing pass.
+    [ValidateRange(0, 1440)]
+    [int]$ChangeWithdrawAfterMinutes = 30,
+
+    # Slack either side of a change window during which the shutdown side still
+    # treats the machine as hands-off, so the two never race at the boundary.
+    [ValidateRange(0, 720)]
+    [int]$ChangeWindowGraceMinutes = 15,
+
+    # ---- Paths ------------------------------------------------------------
+    [string]$StateFile       = 'C:\Temp\Martin\AutoMaintV2\ScomShutdownMM.csv',
+    [string]$ChangeStateFile = 'C:\Temp\Martin\AutoMaintV2\ScomChangeWindows.csv',
+    [string]$NotifyStateFile = 'C:\Temp\Martin\AutoMaintV2\ScomShutdownMM.notify.json',
+
+    # CHANGE mode's own notification state. It runs under a DIFFERENT mutex from
+    # APPLY/SWEEP/DIGEST, so one shared read-modify-write file is the last place
+    # the two sides can still clobber each other - and LastTrackedCount lives in
+    # it, which is what Test-StateLoss compares against to tell real state loss
+    # from a legitimate drain to zero. Separate files, no race.
+    [string]$ChangeNotifyStateFile = 'C:\Temp\Martin\AutoMaintV2\ScomChangeMM.notify.json',
+    [string]$EventCsvPath    = 'C:\Temp\Martin\AutoMaintV2\ScomShutdownMM.events.csv',
+    [string]$ReportPath      = 'C:\Temp\Martin\AutoMaintV2\ScomDormantAgents.csv',
+    [string]$LogPath         = 'C:\Temp\Martin\AutoMaintV2\ScomShutdownMM.log',
+
+    # Machines this script must NEVER put into maintenance mode - management
+    # servers above all. See EXCLUSIONS above for the format. '' turns the
+    # feature off; a missing file means nothing is excluded.
+    [string]$ExclusionFile   = 'C:\Temp\Martin\AutoMaintV2\ScomShutdownMM.Exclusions.txt',
+
+    [ValidateRange(1MB, 512MB)]
+    [long]$LogMaxBytes = 20MB,
+
+    [ValidateRange(1, 50)]
+    [int]$LogKeep = 5,
+
+    [ValidateRange(7, 3650)]
+    [int]$EventRetentionDays = 90,
+
+    # Seconds to wait for the other task to finish before giving up this pass.
+    # Keep this well under LoopIntervalSeconds so a slow sweep costs one
+    # iteration rather than the whole window. If not given while the APPLY loop
+    # is on, it defaults to a third of LoopIntervalSeconds (max 20).
+    [ValidateRange(1, 600)]
+    [int]$LockTimeoutSeconds = 90,
+
+    # ---- Windows event log (the watchdog channel) -------------------------
+    [string]$EventLogName = 'Application',
+    [string]$EventSource  = 'ScomShutdownMM',
+    [switch]$NoEventLog,
+
+    # ---- Mail -------------------------------------------------------------
+    # Everything below is inert unless SmtpServer, MailFrom and MailTo are set.
+    [string]$SmtpServer = 'SMTPRelay.diep.mil.au',
+    [ValidateRange(1, 65535)]
+    [int]$SmtpPort = 25,
+    [switch]$SmtpUseSsl,
+
+    # Path to a PSCredential exported with Export-Clixml. DPAPI-encrypted and
+    # bound to the exporting ACCOUNT and MACHINE - re-export if either changes.
+    # Leave empty for an anonymous / IP-allowlisted relay.
+    [string]$SmtpCredentialPath = '',
+
+    [ValidateRange(1000, 120000)]
+    [int]$SmtpTimeoutMs = 15000,
+
+    [string]$MailFrom = 'DIEP-SCOM@DoNotReply.defence.gov.au',
+
+    # Operational faults - you / the SCOM team.
+    [string[]]$MailTo = @('martin.birrell1@defence.gov.au'),
+
+    # Digests - asset owners, service owners. Falls back to MailTo if empty.
+    [string[]]$MailReportTo = @('martin.birrell1@defence.gov.au'),
+
+    [string]$MailSubjectPrefix = '[SCOM-MM]',
+
+    # After a failed send, retry that notification this soon rather than
+    # waiting out its full interval.
+    [ValidateRange(1, 240)]
+    [int]$FailureRetryMinutes = 5,
+
+    # ---- Notification thresholds -----------------------------------------
+    # Total machines suppressed at once. A HARD fence, not just an alarm: at or
+    # above this, no further machine enters maintenance mode this pass and its
+    # alert is left open to surface normally. Set well above your real peak - a
+    # runaway blinds the monitoring for a whole MaintenanceHours window while
+    # looking perfectly healthy from the log, and a genuine outage larger than
+    # this ceiling will alert rather than be suppressed. That is the trade.
+    [ValidateRange(1, 100000)]
+    [int]$TrackedCeiling = 600,
+
+    # Machines entering MM in a SINGLE pass. 0 = off. Turn this on once you
+    # know what your normal burst looks like; legitimate weekend bursts can
+    # run at MaxBatch for several passes.
+    [ValidateRange(0, 1000)]
+    [int]$ApplyBurstCeiling = 0,
+
+    # Maintenance mode failing for this many machines in one pass means
+    # something systemic (rights, SDK, config service), not bad luck.
+    [ValidateRange(1, 1000)]
+    [int]$MmFailureAlertCount = 5,
+
+    # State file GONE while this many machines were tracked = state loss.
+    # A file that merely reads empty is a legitimate drain and is not alerted.
+    [ValidateRange(1, 10000)]
+    [int]$StateLossThreshold = 10,
+
+    # Fraction of tracked machines answering ping with nothing on AgentPort
+    # before this is treated as a blocked port rather than broken agents.
+    [ValidateRange(0.1, 1.0)]
+    [double]$PortBlindRatio = 0.8
+)
+
+$ErrorActionPreference = 'Stop'
+$Marker = 'AutoMM-Shutdown-1074'
+
+$script:Errs             = 0     # non-zero exit if anything failed
+$script:StateFileExisted = $true
+$script:StateRecoveredFrom = $null   # set by Get-TrackedState when .bak was used
+$script:LogRotateChecked = $false
+$script:LockSkips        = 0     # iterations that deferred to the other task
+$script:EventSourceOk    = $null
+$script:SmtpCred         = $null
+$script:MailWarned       = $false
+
+# $null = not yet probed, $true = window comments are readable and ownership
+# can be decided, $false = they are not, so every window is treated as ours and
+# behaviour is exactly as it was before ownership existed. See Get-MaintenanceOwner.
+$script:MmCommentReadable = $null
+
+# $null = not yet probed, $true = the SDK gives us maintenance window end times,
+# $false = it does not and extends fall back to confirming InMaintenanceMode
+# alone. See Get-MaintenanceEndUtc.
+$script:MmWindowReadable = $null
+
+# How this SDK build reports a window end whose DateTimeKind is Unspecified.
+# $null = not yet established, 'Utc' or 'Local' once a window we set ourselves
+# has settled it. See Register-MaintenanceWindowKind.
+$script:MmWindowKind       = $null
+$script:MmWindowKindWarned = $false
+
+# Accumulated across every iteration of one invocation, reported in the
+# closing Windows event.
+$script:Stats = [ordered]@{
+    Passes     = 0
+    Applied    = 0
+    Released   = 0
+    Extended   = 0
+    Reapplied  = 0
+    MmFailures = 0
+    Orphans    = 0
+    PingOnly   = 0
+    Tracked    = 0
+    ChgCreated = 0
+    ChgAmended = 0
+    ChgRemoved = 0
+    Excluded   = 0
+}
+
+# Exclusion list. $null = not loaded yet this invocation. See Get-ExclusionList.
+$script:Exclusions       = $null
+$script:ExclusionStamp   = $null
+$script:ExclusionWarned  = $false
+$script:ExcludedLogged   = @{}     # FQDNs already logged this invocation
+
+# --------------------------------------------------------------------------
+# Startup validation
+# --------------------------------------------------------------------------
+if ($PSVersionTable.PSEdition -eq 'Core') {
+    throw 'This script requires Windows PowerShell 5.1. The OperationsManager module does not load in PowerShell 7.'
+}
+
+if ($ExtendWhenWithinHours -ge $MaintenanceHours) {
+    throw ("ExtendWhenWithinHours ({0}) must be less than MaintenanceHours ({1}); otherwise every sweep extends every machine and you churn agent config for nothing." -f
+           $ExtendWhenWithinHours, $MaintenanceHours)
+}
+
+if ($Sweep -and $Digest) {
+    throw 'Use -Sweep or -Digest, not both.'
+}
+
+if ($Change -and ($Sweep -or $Digest)) {
+    throw 'Use -Change on its own. It is a separate task from -Sweep and -Digest.'
+}
+
+if ($Change) {
+    if ([string]::IsNullOrWhiteSpace($ChangeSqlServer) -or [string]::IsNullOrWhiteSpace($ChangeDatabase)) {
+        throw '-Change needs -ChangeSqlServer and -ChangeDatabase.'
+    }
+}
+
+function Get-RunMode {
+    if ($Sweep) { 'SWEEP' } elseif ($Digest) { 'DIGEST' } elseif ($Change) { 'CHANGE' } else { 'APPLY' }
+}
+
+# Watchdog event base per mode: +0 clean, +1 with errors, +2 did no work.
+# APPLY keeps 9100-9102, so anything already watching those carries on working.
+function Get-EventBase {
+    switch (Get-RunMode) { 'SWEEP' { 9110 } 'DIGEST' { 9120 } 'CHANGE' { 9130 } default { 9100 } }
+}
+
+# How an invocation ended, as the watchdog event and exit code it gets.
+# Zero completed passes is NOT success: a run that never won the lock, or whose
+# every pass threw, did nothing - and must not satisfy the Missing Event monitor.
+function Get-RunOutcome {
+    param([int]$Passes, [int]$Errors, [int]$LockSkips = 0)
+    $base = Get-EventBase
+
+    if ($Passes -le 0) {
+        # No pass completed - but WHY decides which signal this is. Every
+        # iteration deferring to the other task holding the mutex is a BUSY
+        # system, not a broken one. Reporting that as x102 fires the did-no-work
+        # rule on a healthy management server, and a slow SWEEP holding the lock
+        # for longer than the APPLY budget does exactly that. x101 keeps the
+        # Missing Event monitor satisfied - the script IS running and is not the
+        # thing at fault - while still surfacing as a warning that names the cause.
+        if ($LockSkips -gt 0) { return [pscustomobject]@{ EventId = $base + 1; EntryType = 'Warning';     ExitCode = 2 } }
+        return                       [pscustomobject]@{ EventId = $base + 2; EntryType = 'Error';       ExitCode = 1 }
+    }
+    if ($Errors -gt 0) { return [pscustomobject]@{ EventId = $base + 1; EntryType = 'Warning';     ExitCode = 2 } }
+    return                    [pscustomobject]@{ EventId = $base;     EntryType = 'Information'; ExitCode = 0 }
+}
+
+# The internal loop is an APPLY feature. SWEEP, DIGEST, CHANGE and -DryRun are
+# always single-pass, whatever -LoopIntervalSeconds says. This used to THROW for
+# them, so hard-coding LoopIntervalSeconds as the parameter default killed the
+# SWEEP and DIGEST tasks outright. Now they simply ignore it - and only say so
+# when it was passed on their own command line, where it is probably a mistake.
+function Resolve-LoopSettings {
+    param([System.Collections.IDictionary]$Bound = @{})
+
+    $mode = Get-RunMode
+    if ($script:LoopIntervalSeconds -gt 0 -and ($mode -ne 'APPLY' -or $DryRun)) {
+        if ($Bound.ContainsKey('LoopIntervalSeconds')) {
+            Write-Warning ("-LoopIntervalSeconds applies to APPLY only; {0} runs a single pass." -f
+                           $(if ($DryRun) { '-DryRun' } else { $mode }))
+        }
+        $script:LoopIntervalSeconds = 0
+    }
+    if ($script:LoopIntervalSeconds -le 0) { return }
+
+    if ($script:LoopIntervalSeconds -gt $LoopBudgetSeconds) {
+        throw "LoopIntervalSeconds ($($script:LoopIntervalSeconds)) exceeds LoopBudgetSeconds ($LoopBudgetSeconds) - only one pass would ever run."
+    }
+
+    # The 90s default suits SWEEP waiting on an APPLY pass. Inside a 60s loop it
+    # would let one slow sweep eat whole iterations, so derive it unless told.
+    if (-not $Bound.ContainsKey('LockTimeoutSeconds')) {
+        $script:LockTimeoutSeconds = [int][Math]::Max(1, [Math]::Min(20, [Math]::Floor($script:LoopIntervalSeconds / 3)))
+    }
+    elseif ($script:LockTimeoutSeconds -ge $script:LoopIntervalSeconds) {
+        Write-Warning "LockTimeoutSeconds ($($script:LockTimeoutSeconds)) is not shorter than LoopIntervalSeconds ($($script:LoopIntervalSeconds)); a slow sweep will consume whole iterations waiting for the lock."
+    }
+}
+Resolve-LoopSettings -Bound $PSBoundParameters
+
+# The DNS/ping/TCP fan-out is only as parallel as the thread pool allows. On
+# .NET Framework the pool grows roughly one thread per 500ms, so a 400-name
+# batch serialises badly at the default minimum. Cheapest win in the script.
+try { [System.Threading.ThreadPool]::SetMinThreads(256, 256) | Out-Null } catch { }
+
+# ==========================================================================
+# Logging
+# ==========================================================================
+function Invoke-LogRotation {
+    if ($script:LogRotateChecked) { return }
+    $script:LogRotateChecked = $true
+    try {
+        if (-not (Test-Path $LogPath)) { return }
+        $fi = Get-Item -Path $LogPath -ErrorAction Stop
+        if ($fi.Length -lt $LogMaxBytes) { return }
+
+        for ($i = $LogKeep; $i -ge 1; $i--) {
+            $older = "$LogPath.$i"
+            $newer = if ($i -eq 1) { $LogPath } else { "$LogPath.$($i - 1)" }
+            if (Test-Path $newer) {
+                if ($i -eq $LogKeep -and (Test-Path $older)) { Remove-Item $older -Force -ErrorAction SilentlyContinue }
+                Move-Item -Path $newer -Destination $older -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch { }
+}
+
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO')
+    if ($Level -eq 'ERROR') { $script:Errs++ }
+    $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    Write-Verbose $line
+    try {
+        $dir = Split-Path -Path $LogPath -Parent
+        if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        Invoke-LogRotation
+        Add-Content -Path $LogPath -Value $line
+    } catch { }
+}
+
+# One event per invocation. A SCOM rule on the ABSENCE of the x100/x101 events is the
+# watchdog - that is the one thing email can never tell you, because a script
+# that has stopped running cannot send it.
+function Write-AppEvent {
+    param([int]$EventId, [string]$EntryType, [string]$Message)
+    # A dry run must never write a watchdog event. The watchdog rule fires on their
+    # ABSENCE, so a dry run that emitted one would quietly reassure you that a
+    # script which changed nothing was doing its job.
+    if ($NoEventLog -or $DryRun) { return }
+    try {
+        if ($null -eq $script:EventSourceOk) {
+            $script:EventSourceOk = [System.Diagnostics.EventLog]::SourceExists($EventSource)
+            if (-not $script:EventSourceOk) {
+                # Needs elevation; succeeds once then never runs again.
+                New-EventLog -LogName $EventLogName -Source $EventSource -ErrorAction Stop
+                $script:EventSourceOk = $true
+            }
+        }
+        if ($script:EventSourceOk) {
+            Write-EventLog -LogName $EventLogName -Source $EventSource -EventId $EventId `
+                -EntryType $EntryType -Message $Message -ErrorAction Stop
+        }
+    } catch {
+        $script:EventSourceOk = $false
+        Write-Verbose "Event log write failed: $($_.Exception.Message)"
+    }
+}
+
+# One line of the dry-run plan. Goes to stdout so the scheduled task or the
+# console shows it, and to the log so it can be compared with what a later real
+# pass actually did.
+function Write-Plan {
+    param([string]$Action, [string]$Fqdn, [string]$Detail = '')
+    $line = 'DRYRUN  {0,-11} {1,-45} {2}' -f $Action, $Fqdn, $Detail
+    Write-Output $line
+    Write-Log $line
+}
+
+# ==========================================================================
+# Small helpers
+# ==========================================================================
+function ConvertTo-Utc {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    try {
+        return [datetime]::Parse($Value, [Globalization.CultureInfo]::InvariantCulture,
+                                 [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+    } catch { return $null }
+}
+
+function ConvertTo-Int {
+    param($Value)
+    $n = 0
+    if ($null -ne $Value) { [int]::TryParse([string]$Value, [ref]$n) | Out-Null }
+    return $n
+}
+
+function ConvertTo-HashtableDeep {
+    param($InputObject)
+    if ($null -eq $InputObject) { return $null }
+    if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
+        $h = @{}
+        foreach ($p in $InputObject.PSObject.Properties) { $h[$p.Name] = ConvertTo-HashtableDeep $p.Value }
+        return $h
+    }
+    if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
+        $l = New-Object System.Collections.Generic.List[object]
+        foreach ($i in $InputObject) { $l.Add((ConvertTo-HashtableDeep $i)) }
+        return , $l.ToArray()
+    }
+    return $InputObject
+}
+
+function New-ParentDirectory {
+    param([string]$Path)
+    $dir = Split-Path -Path $Path -Parent
+    if ($dir -and -not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+}
+
+# Proper CSV quoting for the hand-built event rows. An FQDN will never contain
+# a comma, but a Detail field carrying an exception message can, and an
+# unquoted comma silently shifts every later column on read-back.
+function ConvertTo-CsvField {
+    param($Value)
+    $s = [string]$Value
+    if ($s -match '[",\r\n]') { return '"' + ($s -replace '"', '""') + '"' }
+    return $s
+}
+
+# ==========================================================================
+# Exclusions - machines this script must never put into maintenance mode
+# ==========================================================================
+# Returns the entries as objects { Text; Pattern }. Re-read only when the file's
+# timestamp changes, so an edit takes effect on the next pass with no restart
+# and an unchanged file costs one Get-Item.
+#
+# FAILURE DIRECTION: a file that exists but cannot be read must never be taken
+# as "nothing is excluded" - that is exactly how a management server ends up in
+# maintenance mode. The last good copy is used if there is one; otherwise this
+# throws, Invoke-Pass logs it as an ERROR, and the pass does nothing at all.
+function Get-ExclusionList {
+    if ([string]::IsNullOrWhiteSpace($ExclusionFile)) { return }
+
+    if (-not (Test-Path -LiteralPath $ExclusionFile -PathType Leaf)) {
+        if (-not $script:ExclusionWarned) {
+            $script:ExclusionWarned = $true
+            Write-Log "No exclusion file at $ExclusionFile - no machine is exempt from maintenance mode." 'WARN'
+        }
+        $script:Exclusions = @(); $script:ExclusionStamp = $null
+        return
+    }
+
+    try {
+        $stamp = (Get-Item -LiteralPath $ExclusionFile -ErrorAction Stop).LastWriteTimeUtc
+        if ($null -ne $script:Exclusions -and $script:ExclusionStamp -eq $stamp) { return $script:Exclusions }
+
+        $list = New-Object System.Collections.Generic.List[object]
+        foreach ($line in @(Get-Content -LiteralPath $ExclusionFile -ErrorAction Stop)) {
+            $text = ([string]$line -replace '#.*$', '').Trim()
+            if (-not $text) { continue }
+
+            $wp = New-Object System.Management.Automation.WildcardPattern($text, [System.Management.Automation.WildcardOptions]::IgnoreCase)
+            try { [void]$wp.IsMatch('') }
+            catch {
+                # e.g. an unbalanced '['. Match it literally rather than drop it.
+                Write-Log "Exclusion entry '$text' is not a valid wildcard pattern - matching it literally." 'WARN'
+                $wp = New-Object System.Management.Automation.WildcardPattern(
+                          [System.Management.Automation.WildcardPattern]::Escape($text),
+                          [System.Management.Automation.WildcardOptions]::IgnoreCase)
+            }
+            $list.Add([pscustomobject]@{ Text = $text; Pattern = $wp })
+        }
+
+        $script:Exclusions     = $list.ToArray()
+        $script:ExclusionStamp = $stamp
+        Write-Log ("Exclusion list loaded from {0}: {1} entr{2}{3}" -f $ExclusionFile, $list.Count,
+                   $(if ($list.Count -eq 1) { 'y' } else { 'ies' }),
+                   $(if ($list.Count -gt 0) { ' - ' + (($list | ForEach-Object { $_.Text }) -join ', ') } else { '' }))
+        return $script:Exclusions
+    } catch {
+        if ($null -ne $script:Exclusions -and $null -ne $script:ExclusionStamp) {
+            Write-Log "Exclusion file $ExclusionFile could not be re-read ($($_.Exception.Message)); using the copy loaded earlier." 'WARN'
+            return $script:Exclusions
+        }
+        throw "Exclusion file $ExclusionFile exists but cannot be read ($($_.Exception.Message)). Nothing is done this pass rather than risk putting an excluded machine into maintenance mode."
+    }
+}
+
+# The exclusion entry a machine matches, or $null. Tested against the FQDN and
+# the short host name, so 'SCOMMS01' and 'scomms01.contoso.com' both match.
+function Get-ExclusionMatch {
+    param([string]$Fqdn, [object[]]$Exclusions)
+    if ([string]::IsNullOrWhiteSpace($Fqdn) -or -not $Exclusions) { return $null }
+    $short = $Fqdn.Split('.')[0]
+    foreach ($x in $Exclusions) {
+        if ($x.Pattern.IsMatch($Fqdn) -or $x.Pattern.IsMatch($short)) { return $x.Text }
+    }
+    return $null
+}
+
+# ==========================================================================
+# Tracked state (the machines currently suppressed)
+# ==========================================================================
+# Reads the old schema too - missing columns default rather than blowing up.
+# Sets $script:StateFileExisted, which is how state LOSS is told apart from a
+# legitimate drain to zero.
+function Get-TrackedState {
+    $script:StateRecoveredFrom = $null
+    $script:StateFileExisted   = Test-Path $StateFile
+
+    $rows = $null
+    if ($script:StateFileExisted) {
+        try {
+            $rows = @(Import-Csv -Path $StateFile -ErrorAction Stop)
+        } catch {
+            # An unreadable file is loss, not emptiness. Say so and do not
+            # silently start from scratch.
+            Write-Log "State file exists but could not be parsed: $($_.Exception.Message)" 'ERROR'
+            $rows = $null
+            $script:StateFileExisted = $false
+
+            # Keep the unreadable file. Recovery below would otherwise overwrite
+            # the only evidence of how it got corrupted.
+            if (-not $DryRun) {
+                try {
+                    Move-Item -Path $StateFile -Destination "$StateFile.corrupt" -Force
+                    Write-Log "Unreadable state file kept at ${StateFile}.corrupt for inspection." 'WARN'
+                } catch {
+                    Write-Log "Could not set the unreadable state file aside: $($_.Exception.Message)" 'WARN'
+                }
+            }
+        }
+    }
+
+    # ---- Recover from the backup ------------------------------------------
+    # Set-TrackedState leaves the previous generation at .bak on every
+    # successful write, so it is at most one pass behind. Reading it beats
+    # starting from nothing by a wide margin: every machine it names really is
+    # in maintenance mode right now, and without this they would stay suppressed
+    # and untracked until their windows expired - which at a weekend peak is a
+    # few hundred machines going dark and then alerting together.
+    #
+    # What is lost is at most one pass of changes, and the next sweep re-derives
+    # all of it from SCOM anyway.
+    if ($null -eq $rows) {
+        $bak = "$StateFile.bak"
+        if (Test-Path $bak) {
+            try {
+                $bakRows = @(Import-Csv -Path $bak -ErrorAction Stop)
+                if ($bakRows.Count -gt 0) {
+                    $rows = $bakRows
+                    $script:StateRecoveredFrom = $bak
+                    $script:StateFileExisted   = $true
+                    Write-Log "Primary state file missing or unreadable - recovered $($bakRows.Count) machine(s) from $bak." 'ERROR'
+                    Add-EventRecord -Type 'StateRecovered' -Fqdn '' -Detail $bakRows.Count
+
+                    if (-not $DryRun) {
+                        # Put the primary back, so this is a one-off event rather
+                        # than something every pass repeats.
+                        try { Copy-Item -Path $bak -Destination $StateFile -Force }
+                        catch { Write-Log "Recovered in memory, but could not restore the primary state file: $($_.Exception.Message)" 'WARN' }
+                    }
+                } else {
+                    # An empty backup recovers nothing. Do not dress that up as
+                    # a recovery - fall through to the loss path.
+                    Write-Log "Backup state file at $bak is empty; nothing to recover." 'WARN'
+                }
+            } catch {
+                Write-Log "Backup state file at $bak is also unreadable: $($_.Exception.Message)" 'ERROR'
+            }
+        }
+    }
+
+    if ($null -eq $rows) { return @() }
+
+    $out  = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($r in $rows) {
+        if ([string]::IsNullOrWhiteSpace($r.Fqdn) -or [string]::IsNullOrWhiteSpace($r.InstanceId)) { continue }
+        if ($seen[$r.InstanceId]) { continue }   # tolerate a duplicated file
+        $seen[$r.InstanceId] = $true
+        $props = $r.PSObject.Properties
+        $out.Add([pscustomobject]@{
+            Fqdn            = $r.Fqdn
+            InstanceId      = $r.InstanceId
+            AppliedUtc      = $r.AppliedUtc
+            EndUtc          = $r.EndUtc
+            PingStreak      = $(if ($props['PingStreak'])      { ConvertTo-Int $r.PingStreak }     else { 0 })
+            PingOnlyStreak  = $(if ($props['PingOnlyStreak'])  { ConvertTo-Int $r.PingOnlyStreak } else { 0 })
+            LastReportedUtc = $(if ($props['LastReportedUtc']) { $r.LastReportedUtc }              else { '' })
+            LastDnsOkUtc    = $(if ($props['LastDnsOkUtc'])    { $r.LastDnsOkUtc }                 else { '' })
+            ForeignSinceUtc = $(if ($props['ForeignSinceUtc']) { $r.ForeignSinceUtc }              else { '' })
+        })
+    }
+    return $out.ToArray()
+}
+
+function Set-TrackedState {
+    param($Rows)
+    if ($DryRun) { Write-Verbose 'DRYRUN: tracked state not written.'; return }
+    New-ParentDirectory -Path $StateFile
+    $arr = [object[]]$Rows # $arr    = @($Rows)
+    $header = 'Fqdn,InstanceId,AppliedUtc,EndUtc,PingStreak,PingOnlyStreak,LastReportedUtc,LastDnsOkUtc,ForeignSinceUtc'
+
+    # Write beside the target and swap, so a crash mid-write cannot leave a
+    # truncated state file - that would strand everything in it.
+    $tmp = "$StateFile.tmp"
+    if ($arr.Count -gt 0) {
+        $arr | Select-Object Fqdn, InstanceId, AppliedUtc, EndUtc, PingStreak, PingOnlyStreak, LastReportedUtc, LastDnsOkUtc, ForeignSinceUtc |
+            Export-Csv -Path $tmp -NoTypeInformation -Force
+    } else {
+        Set-Content -Path $tmp -Value $header -Force
+    }
+
+    if (Test-Path $StateFile) {
+        # Replace is atomic and leaves the previous generation as .bak.
+        try {
+            [System.IO.File]::Replace($tmp, $StateFile, "$StateFile.bak", $true)
+        } catch {
+            # Replace refused (a locked .bak, antivirus, an odd filesystem). The
+            # plain move used to skip the backup, so the next loss of the
+            # primary had nothing - or something stale - to recover from.
+            # Not atomic, but it keeps the one-pass-behind promise.
+            Write-Log "State file swap failed ($($_.Exception.Message)); falling back to copy-then-move." 'WARN'
+            try { Copy-Item -Path $StateFile -Destination "$StateFile.bak" -Force -ErrorAction Stop }
+            catch { Write-Log "Could not refresh ${StateFile}.bak: $($_.Exception.Message)" 'WARN' }
+            Move-Item -Path $tmp -Destination $StateFile -Force
+        }
+    } else {
+        Move-Item -Path $tmp -Destination $StateFile -Force
+    }
+}
+
+# ==========================================================================
+# Event history (feeds the weekly digest)
+# ==========================================================================
+function Add-EventRecord {
+    param([string]$Type, [string]$Fqdn, [string]$Detail = '')
+    if ($DryRun) { return }
+    try {
+        New-ParentDirectory -Path $EventCsvPath
+        if (-not (Test-Path $EventCsvPath)) {
+            Set-Content -Path $EventCsvPath -Value 'Utc,Type,Fqdn,Detail' -Force
+        }
+        $line = @(
+            ConvertTo-CsvField ([datetime]::UtcNow.ToString('o'))
+            ConvertTo-CsvField $Type
+            ConvertTo-CsvField $Fqdn
+            ConvertTo-CsvField $Detail
+        ) -join ','
+        Add-Content -Path $EventCsvPath -Value $line
+    } catch {
+        Write-Verbose "Event record write failed: $($_.Exception.Message)"
+    }
+}
+
+function Get-EventRecords {
+    param([int]$Days = 7)
+    if (-not (Test-Path $EventCsvPath)) { return @() }
+    $cutoff = [datetime]::UtcNow.AddDays(-$Days)
+    try {
+        return @(Import-Csv -Path $EventCsvPath -ErrorAction Stop | Where-Object {
+            $t = ConvertTo-Utc $_.Utc
+            $t -and $t -ge $cutoff
+        })
+    } catch {
+        Write-Log "Event history unreadable: $($_.Exception.Message)" 'WARN'
+        return @()
+    }
+}
+
+# ==========================================================================
+# Notification state (rate limiting, and the counters that survive state loss)
+# ==========================================================================
+# The notification-state file THIS invocation owns. CHANGE keeps its own, so the
+# two mutexes never share a read-modify-write file. See ChangeNotifyStateFile.
+#
+# Resolved on every call rather than latched at startup, so anything that sets
+# $NotifyStateFile after the parameter block - the test harness does exactly
+# this to redirect state into a temp directory - still redirects it.
+function Get-NotifyPath {
+    if ($Change) { return $ChangeNotifyStateFile }
+    return $NotifyStateFile
+}
+
+function Get-NotifyState {
+    $empty = @{ LastTrackedCount = 0; Orphans = @{}; Excluded = @{}; Notify = @{} }
+    $path = Get-NotifyPath
+    if (-not (Test-Path $path)) { return $empty }
+    try {
+        $raw = Get-Content -Path $path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $empty }
+        $h = ConvertTo-HashtableDeep ($raw | ConvertFrom-Json)
+        if ($null -eq $h)                  { return $empty }
+        if ($null -eq $h['Orphans'])       { $h['Orphans'] = @{} }
+        if ($null -eq $h['Excluded'])      { $h['Excluded'] = @{} }
+        if ($null -eq $h['Notify'])        { $h['Notify'] = @{} }
+        if ($null -eq $h['LastTrackedCount']) { $h['LastTrackedCount'] = 0 }
+        return $h
+    } catch {
+        Write-Log "Notification state unreadable, starting fresh: $($_.Exception.Message)" 'WARN'
+        return $empty
+    }
+}
+
+function Set-NotifyState {
+    param([hashtable]$State)
+    if ($DryRun) { Write-Verbose 'DRYRUN: notification state not written.'; return }
+    try {
+        $path = Get-NotifyPath
+        New-ParentDirectory -Path $path
+        # Per-PROCESS temp name. Two invocations both writing "<file>.tmp" clobber
+        # each other's temp, and one Move-Item then fails into the catch below -
+        # silently losing that update.
+        $tmp = "$path.$PID.tmp"
+        ($State | ConvertTo-Json -Depth 6) | Set-Content -Path $tmp -Force -Encoding UTF8
+        Move-Item -Path $tmp -Destination $path -Force
+    } catch {
+        Write-Log "Could not write notification state: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+# ==========================================================================
+# Mail
+# ==========================================================================
+function Test-MailConfigured {
+    $ok = -not [string]::IsNullOrWhiteSpace($SmtpServer) -and
+          -not [string]::IsNullOrWhiteSpace($MailFrom) -and
+          $MailTo.Count -gt 0
+    if (-not $ok -and -not $script:MailWarned) {
+        $script:MailWarned = $true
+        Write-Verbose 'Mail is not configured (SmtpServer / MailFrom / MailTo); notifications will be logged only.'
+    }
+    return $ok
+}
+
+function Get-SmtpCredential {
+    if ([string]::IsNullOrWhiteSpace($SmtpCredentialPath)) { return $null }
+    if ($script:SmtpCred) { return $script:SmtpCred }
+    try {
+        $script:SmtpCred = Import-Clixml -Path $SmtpCredentialPath -ErrorAction Stop
+        return $script:SmtpCred
+    } catch {
+        # DPAPI is bound to the exporting account AND machine.
+        Write-Log "SMTP credential at '$SmtpCredentialPath' could not be read - re-export it as the task's service account on this machine: $($_.Exception.Message)" 'ERROR'
+        return $null
+    }
+}
+
+# Never throws. A failed send must never cost a suppression.
+function Send-Mail {
+    param(
+        [string[]]$To,
+        [string]$Subject,
+        [string]$Body,
+        [string[]]$Attachment = @()
+    )
+    if ($DryRun) { Write-Log "DRYRUN: would mail '$Subject' to $($To -join ', ')."; return $true }
+    $smtp = $null; $msg = $null
+    $opened = New-Object System.Collections.Generic.List[object]
+    try {
+        $smtp           = New-Object System.Net.Mail.SmtpClient($SmtpServer, $SmtpPort)
+        $smtp.Timeout   = $SmtpTimeoutMs
+        $smtp.EnableSsl = [bool]$SmtpUseSsl
+
+        $cred = Get-SmtpCredential
+        if ($cred) {
+            $nc = $cred.GetNetworkCredential()
+            $smtp.Credentials = New-Object System.Net.NetworkCredential($nc.UserName, $nc.Password, $nc.Domain)
+        }
+
+        $msg         = New-Object System.Net.Mail.MailMessage
+        $msg.From    = New-Object System.Net.Mail.MailAddress($MailFrom)
+        $msg.Subject = $Subject
+        $msg.Body    = $Body
+        foreach ($t in $To) { if (-not [string]::IsNullOrWhiteSpace($t)) { $msg.To.Add($t.Trim()) } }
+        if ($msg.To.Count -eq 0) { return $false }
+
+        foreach ($a in $Attachment) {
+            if ($a -and (Test-Path $a)) {
+                $att = New-Object System.Net.Mail.Attachment($a)
+                $opened.Add($att)
+                $msg.Attachments.Add($att)
+            }
+        }
+
+        $smtp.Send($msg)
+        return $true
+    } catch {
+        Write-Log "Mail send failed: $($_.Exception.Message)" 'WARN'
+        return $false
+    } finally {
+        foreach ($a in $opened) { try { $a.Dispose() } catch { } }
+        if ($msg)  { try { $msg.Dispose() }  catch { } }
+        if ($smtp) { try { $smtp.Dispose() } catch { } }
+    }
+}
+
+# Rate-limited notification. $Key identifies the notification type; the same
+# key cannot send more often than $MinIntervalMinutes. Suppressed occurrences
+# are counted and reported in the next message that does go out, so a quiet
+# mailbox never means "nothing happened".
+function Send-Notification {
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [Parameter(Mandatory)][string]$Subject,
+        [Parameter(Mandatory)][string]$Body,
+        [int]$MinIntervalMinutes = 60,
+        [ValidateSet('INFO', 'WARN', 'ERROR')][string]$Severity = 'WARN',
+        [string[]]$To = @(),
+        [string[]]$Attachment = @()
+    )
+
+    Write-Log "NOTIFY[$Key] $Subject" $Severity
+
+    if ($DryRun) { Write-Plan 'NOTIFY' $Key $Subject; return }
+    if (-not (Test-MailConfigured)) { return }
+
+    $recipients = if ($To.Count -gt 0) { $To } else { $MailTo }
+    $nowUtc     = [datetime]::UtcNow
+
+    $state = Get-NotifyState
+    $entry = $state['Notify'][$Key]
+    if ($null -eq $entry) {
+        $entry = @{ NextEligibleUtc = ''; LastSentUtc = ''; SuppressedCount = 0; FirstSuppressedUtc = '' }
+    }
+
+    $nextEligible = ConvertTo-Utc ([string]$entry['NextEligibleUtc'])
+    if ($nextEligible -and $nowUtc -lt $nextEligible) {
+        $entry['SuppressedCount'] = (ConvertTo-Int $entry['SuppressedCount']) + 1
+        if ([string]::IsNullOrWhiteSpace([string]$entry['FirstSuppressedUtc'])) {
+            $entry['FirstSuppressedUtc'] = $nowUtc.ToString('o')
+        }
+        $state['Notify'][$Key] = $entry
+        Set-NotifyState -State $state
+        Write-Verbose "Notification '$Key' suppressed (next eligible $nextEligible UTC)."
+        return
+    }
+
+    $suppressed = ConvertTo-Int $entry['SuppressedCount']
+    $preamble   = ''
+    if ($suppressed -gt 0) {
+        $since = ConvertTo-Utc ([string]$entry['FirstSuppressedUtc'])
+        $preamble = ("NOTE: {0} further occurrence(s) of this condition were suppressed by rate limiting{1}.`r`n`r`n" -f
+                     $suppressed, $(if ($since) { " since $($since.ToString('u'))" } else { '' }))
+    }
+
+    $full = @(
+        $preamble
+        $Body
+        ''
+        '---'
+        ("Host            : {0}" -f $env:COMPUTERNAME)
+        ("Management group: {0}" -f ($ManagementServer -join ', '))
+        ("Generated       : {0} UTC" -f $nowUtc.ToString('u'))
+        ("Notification    : {0} (rate limit {1} min)" -f $Key, $MinIntervalMinutes)
+        ("Log             : {0}" -f $LogPath)
+    ) -join "`r`n"
+
+    $subj = '{0}[{1}] {2}' -f $MailSubjectPrefix, $Severity, $Subject
+    $sent = Send-Mail -To $recipients -Subject $subj -Body $full -Attachment $Attachment
+
+    if ($sent) {
+        $entry['LastSentUtc']        = $nowUtc.ToString('o')
+        $entry['NextEligibleUtc']    = $nowUtc.AddMinutes($MinIntervalMinutes).ToString('o')
+        $entry['SuppressedCount']    = 0
+        $entry['FirstSuppressedUtc'] = ''
+    } else {
+        # Back off briefly rather than retrying every pass into a dead gateway,
+        # but do not burn the whole interval on a transient failure.
+        $entry['NextEligibleUtc'] = $nowUtc.AddMinutes($FailureRetryMinutes).ToString('o')
+    }
+
+    $state['Notify'][$Key] = $entry
+    Set-NotifyState -State $state
+}
+
+# ==========================================================================
+# SCOM helpers
+# ==========================================================================
+# One SDK round trip per 200 machines instead of one per machine. Returns a
+# hashtable keyed by instance id string.
+function Get-InstanceMap {
+    param([string[]]$Ids)
+    $map = @{}
+    if (-not $Ids -or $Ids.Count -eq 0) { return $map }
+
+    $guids = New-Object System.Collections.Generic.List[guid]
+    foreach ($id in $Ids) {
+        $g = [guid]::Empty
+        if ([guid]::TryParse([string]$id, [ref]$g)) { $guids.Add($g) }
+    }
+    if ($guids.Count -eq 0) { return $map }
+
+    $chunk = 200
+    for ($i = 0; $i -lt $guids.Count; $i += $chunk) {
+        $slice = $guids.GetRange($i, [Math]::Min($chunk, $guids.Count - $i)).ToArray()
+        try {
+            foreach ($inst in @(Get-SCOMClassInstance -Id $slice)) {
+                if ($inst) { $map[$inst.Id.ToString()] = $inst }
+            }
+        } catch {
+            Write-Log "Instance fetch failed for a chunk of $($slice.Count): $($_.Exception.Message)" 'ERROR'
+        }
+    }
+    return $map
+}
+
+# The read that decides whether an MM write took. Same as Get-InstanceMap, but
+# anything that does not read as expected gets a settle wait and up to two more
+# looks before it is called a failure.
+#
+# "The SDK call did not throw" is not proof, which is why every write here is
+# verified - but the verification read used to happen on the same tick as the
+# write. A read that catches the pre-write state gets logged as a hard MM
+# failure, counted in Stats.MmFailures, and at MmFailureAlertCount of them in
+# one pass it mails "maintenance mode failing wholesale" on a pass where nothing
+# was wrong. Monday morning, releasing a hundred machines at once, is precisely
+# where that threshold gets crossed.
+#
+# Only the stragglers are re-read, AND the settle wait is only paid when
+# something actually reads stale - so the normal case, everything took, now
+# costs one read and no sleep at all. Every millisecond in here is spent holding
+# the shutdown mutex, and a sweep that holds it longer than the whole APPLY
+# budget starves APPLY for an entire invocation. The worst case is unchanged.
+function Get-VerifiedInstanceMap {
+    param(
+        [string[]]$Ids,
+        [bool]$ExpectInMaintenanceMode
+    )
+    if (-not $Ids -or $Ids.Count -eq 0) { return @{} }
+
+    # Read first. The SDK round trip is usually settle enough on its own.
+    $map = Get-InstanceMap -Ids $Ids
+    $unsettled = @($Ids | Where-Object {
+        $i = $map[[string]$_]
+        (-not $i) -or ($i.InMaintenanceMode -ne $ExpectInMaintenanceMode)
+    })
+    if ($unsettled.Count -eq 0) { return $map }
+
+    if ($VerifySettleMs -gt 0) {
+        Write-Verbose "$($unsettled.Count) instance(s) had not settled; re-reading after $VerifySettleMs ms."
+        Start-Sleep -Milliseconds $VerifySettleMs
+        foreach ($kv in (Get-InstanceMap -Ids $unsettled).GetEnumerator()) { $map[$kv.Key] = $kv.Value }
+        $unsettled = @($unsettled | Where-Object {
+            $i = $map[[string]$_]
+            (-not $i) -or ($i.InMaintenanceMode -ne $ExpectInMaintenanceMode)
+        })
+        if ($unsettled.Count -eq 0) { return $map }
+    }
+
+    if ($VerifyRetryMs -le 0) { return $map }
+
+    Write-Verbose "$($unsettled.Count) instance(s) still unsettled; one more look after $VerifyRetryMs ms."
+    Start-Sleep -Milliseconds $VerifyRetryMs
+    foreach ($kv in (Get-InstanceMap -Ids $unsettled).GetEnumerator()) { $map[$kv.Key] = $kv.Value }
+    return $map
+}
+
+# Resolve DNS once, then ping and TCP-probe the resolved address concurrently.
+#
+# Ping.SendPingAsync(hostname, ...) resolves DNS on the CALLING thread on
+# .NET Framework, so a batch full of stale names serialises into a queue of DNS
+# timeouts - exactly the batch this script accumulates over multi-week outages.
+# Resolving up front also lets ping and the port probe share one lookup.
+#
+# Returns a hashtable keyed by the name passed in:
+#   Resolved  - DNS answered
+#   Ping      - ICMP echo succeeded
+#   Agent     - TCP connect to $AgentPort succeeded (HealthService is listening)
+#   TcpStatus - why Agent reads the way it does: Connected, TimedOut, a
+#               SocketErrorCode such as ConnectionRefused, or NotProbed.
+#               Diagnostic only - nothing decides anything on it. A dead agent
+#               on a live machine refuses the connection; a firewall drops it
+#               and the probe times out. Both read Agent = $false, and telling
+#               them apart is the difference between chasing HealthService and
+#               chasing a firewall change.
+# Public entry point. Slices the work into waves of $ProbeBatchSize so the
+# number of sockets and ping handles held open at once is bounded, however many
+# machines are tracked. Time cost is one slow probe per wave, not per machine.
+function Test-AgentReachability {
+    param([string[]]$ComputerNames)
+
+    $result = @{}
+    if (-not $ComputerNames -or $ComputerNames.Count -eq 0) { return $result }
+
+    # Timed, because this is the one part of the sweep whose cost can run away
+    # silently. It should be roughly (waves x (PingTimeoutMs + TcpTimeoutMs))
+    # and nothing like the machine count. If this line starts reporting minutes,
+    # the per-protocol deadline in the wave below has been broken.
+    $sw    = [System.Diagnostics.Stopwatch]::StartNew()
+    $names = @($ComputerNames | Select-Object -Unique)
+    for ($i = 0; $i -lt $names.Count; $i += $ProbeBatchSize) {
+        $slice = @($names[$i..([Math]::Min($i + $ProbeBatchSize, $names.Count) - 1)])
+        $wave  = Test-AgentReachabilityWave -ComputerNames $slice
+        foreach ($kv in $wave.GetEnumerator()) { $result[$kv.Key] = $kv.Value }
+    }
+    $sw.Stop()
+
+    # The TCP breakdown is what makes the PortBlind warning below actionable:
+    # a wave that is all ConnectionRefused is a fleet of dead agents on live
+    # machines, and a wave that is all TimedOut is the network.
+    $byStatus = @{}
+    foreach ($v in $result.Values) {
+        $k = [string]$v.TcpStatus
+        if (-not $byStatus.ContainsKey($k)) { $byStatus[$k] = 0 }
+        $byStatus[$k]++
+    }
+    $breakdown = ((@($byStatus.GetEnumerator() | Sort-Object -Property Name) |
+                   ForEach-Object { '{0}={1}' -f $_.Key, $_.Value }) -join ' ')
+
+    Write-Log ('Probed {0} machine(s) in {1} wave(s) in {2:N1}s. TCP {3}: {4}' -f
+               $names.Count, [Math]::Ceiling($names.Count / [double]$ProbeBatchSize), $sw.Elapsed.TotalSeconds,
+               $AgentPort, $breakdown)
+    return $result
+}
+
+function Test-AgentReachabilityWave {
+    param([string[]]$ComputerNames)
+
+    $result = @{}
+    if (-not $ComputerNames -or $ComputerNames.Count -eq 0) { return $result }
+
+    foreach ($n in $ComputerNames) {
+        # Unresolvable / unreachable = down. Never guess up.
+        $result[$n] = [pscustomobject]@{ Resolved = $false; Ping = $false; Agent = $false; TcpStatus = 'NotProbed' }
+    }
+
+    # --- DNS, all in flight at once ----------------------------------------
+    $dns = New-Object System.Collections.Generic.List[object]
+    foreach ($name in @($ComputerNames | Select-Object -Unique)) {
+        try {
+            $dns.Add([pscustomobject]@{ Name = $name; Task = [System.Net.Dns]::GetHostAddressesAsync($name) })
+        } catch { }
+    }
+
+    $targets = New-Object System.Collections.Generic.List[object]
+    foreach ($d in $dns) {
+        try {
+            if ($d.Task.Wait($DnsTimeoutMs)) {
+                $addr = @($d.Task.Result | Where-Object { $_.AddressFamily -eq 'InterNetwork' }) | Select-Object -First 1
+                if (-not $addr) { $addr = @($d.Task.Result) | Select-Object -First 1 }
+                if ($addr) {
+                    $result[$d.Name].Resolved = $true
+                    $targets.Add([pscustomobject]@{ Name = $d.Name; Address = $addr })
+                }
+            }
+        } catch { }
+    }
+    if ($targets.Count -eq 0) { return $result }
+
+    # --- ping + TCP, both in flight ----------------------------------------
+    $pending = New-Object System.Collections.Generic.List[object]
+    foreach ($t in $targets) {
+        $ping = $null; $pTask = $null; $tcp = $null; $tTask = $null
+
+        try {
+            $ping  = New-Object System.Net.NetworkInformation.Ping
+            $pTask = $ping.SendPingAsync($t.Address, $PingTimeoutMs)
+        } catch {
+            if ($ping) { try { $ping.Dispose() } catch { } }
+            $ping = $null; $pTask = $null
+        }
+
+        if (-not $SkipAgentPortCheck) {
+            try {
+                $tcp   = New-Object System.Net.Sockets.TcpClient
+                $tTask = $tcp.ConnectAsync($t.Address, $AgentPort)
+            } catch {
+                if ($tcp) { try { $tcp.Close() } catch { } }
+                $tcp = $null; $tTask = $null
+            }
+        }
+
+        $pending.Add([pscustomobject]@{
+            Name = $t.Name; Ping = $ping; PingTask = $pTask; Tcp = $tcp; TcpTask = $tTask
+        })
+    }
+
+    # ONE deadline per protocol for the whole wave, not one timeout per machine.
+    #
+    # Every task above was started before this point, so they are all running
+    # concurrently - but giving each WAIT its own fresh timeout makes the waits
+    # sequential for anything that does not complete. Ping got away with it:
+    # SendPingAsync gives up on its own at $PingTimeoutMs, so those tasks really
+    # have finished by the time this loop reaches them. ConnectAsync has no
+    # timeout of its own. Against a switched-off host on a network that does not
+    # answer with ICMP unreachable, the connect sits in SYN retransmit for ~21s,
+    # so every per-task wait burned its full $TcpTimeoutMs and they ADDED UP.
+    #
+    # That is this script's whole population - machines deliberately down but
+    # still holding a DNS record - so a wave of 250 cost up to 250 x
+    # $TcpTimeoutMs instead of $TcpTimeoutMs. At 3s that is 12.5 minutes for one
+    # wave: the sweep overruns its own schedule, the 9100 watchdog event goes
+    # quiet long enough to fire the absence rule, and nothing else can win the
+    # lock. Anchoring both loops to an absolute deadline is the whole fix.
+    $pingDeadline = [datetime]::UtcNow.AddMilliseconds($PingTimeoutMs + 1500)
+    $tcpDeadline  = [datetime]::UtcNow.AddMilliseconds($TcpTimeoutMs)
+
+    foreach ($p in $pending) {
+        if ($p.PingTask) {
+            try {
+                $left = [int][Math]::Max(0, ($pingDeadline - [datetime]::UtcNow).TotalMilliseconds)
+                if ($left -gt 0) { [void][System.Threading.Tasks.Task]::WaitAny(@($p.PingTask), $left) }
+                # Status is checked first and -and short-circuits, so .Result is
+                # only touched on a task that has actually completed - reading it
+                # on a pending task would block with no timeout at all.
+                $result[$p.Name].Ping = ($p.PingTask.Status -eq 'RanToCompletion' -and
+                                         $p.PingTask.Result.Status -eq 'Success')
+            } catch {
+            } finally { try { $p.Ping.Dispose() } catch { } }
+        }
+
+        if ($p.TcpTask) {
+            # WaitAny, not Wait: a refused connection FAULTS the task and
+            # Wait() would rethrow it. A refusal is a definitive "not
+            # listening", not an error worth reporting.
+            try {
+                $left = [int][Math]::Max(0, ($tcpDeadline - [datetime]::UtcNow).TotalMilliseconds)
+                if ($left -gt 0) { [void][System.Threading.Tasks.Task]::WaitAny(@($p.TcpTask), $left) }
+                $result[$p.Name].Agent = ($p.TcpTask.Status -eq 'RanToCompletion')
+
+                # Record WHY, not just whether. Reading .Exception also observes
+                # the fault, which the sweep at the end of this function does
+                # anyway. A task still pending at the deadline is a timeout.
+                $result[$p.Name].TcpStatus = $(
+                    if ($p.TcpTask.Status -eq 'RanToCompletion') { 'Connected' }
+                    elseif ($p.TcpTask.IsFaulted) {
+                        $se = @($p.TcpTask.Exception.InnerExceptions |
+                                Where-Object { $_ -is [System.Net.Sockets.SocketException] }) | Select-Object -First 1
+                        if ($se) { [string]$se.SocketErrorCode } else { 'Failed' }
+                    }
+                    else { 'TimedOut' }
+                )
+            } catch {
+            } finally {
+                # Close() aborts a connect still in SYN retry, so no socket is
+                # left held once the wave is done with it.
+                try { $p.Tcp.Close() } catch { }
+            }
+        }
+    }
+
+    # Observe any connect that faulted. Close() aborts asynchronously, so a
+    # fault can land after the loop above has moved on - checking inside that
+    # finally missed most of them. Unobserved task exceptions are harmless on
+    # .NET 4.5+, but there is no reason to leave them for the finalizer.
+    foreach ($p in $pending) {
+        if ($p.TcpTask -and $p.TcpTask.IsFaulted) { $null = $p.TcpTask.Exception }
+    }
+
+    return $result
+}
+
+function Resolve-WindowsComputer {
+    param([string]$Fqdn)
+    $candidates = @(Get-SCOMClassInstance -Name $Fqdn -ErrorAction SilentlyContinue) |
+                  Where-Object { $_.DisplayName -ieq $Fqdn }
+    if (-not $candidates) { return $null }
+
+    # VERIFY (2): FullName is '<least derived non-abstract class>:<key>'.
+    $c = $candidates | Where-Object { $_.FullName -like 'Microsoft.Windows.Computer:*' } | Select-Object -First 1
+    if ($c) { return $c }
+
+    # Fallback: a Windows Computer sits at the top of its hosting chain, so its
+    # Path is empty; hosted objects sharing the display name carry the computer
+    # FQDN as their Path. Less precise - other unhosted computer classes match too.
+    return ($candidates | Where-Object { [string]::IsNullOrEmpty($_.Path) } | Select-Object -First 1)
+}
+
+# Works out how this SDK build reports a window end carrying an Unspecified
+# DateTimeKind, by comparing one against a window WE asked for and therefore
+# already know the answer to.
+#
+# Guessing is not safe here, and the old code guessed UTC. If the build actually
+# hands back local time, that is wrong by the server's UTC offset - ten hours in
+# Australia - and it is wrong in the direction that hides itself: the recorded
+# EndUtc lands FURTHER in the future than the real window, so no extend is ever
+# scheduled, the real window lapses, the machine alerts, and the next sweep
+# quietly reapplies. Nothing in the log says why it keeps happening.
+#
+# Only ever called with an end time this script requested, so a match is proof
+# rather than inference. It latches once per invocation.
+function Register-MaintenanceWindowKind {
+    param([datetime]$Raw, [datetime]$RequestedEndUtc)
+    if ($script:MmWindowKind) { return }
+    if ($Raw.Kind -ne [System.DateTimeKind]::Unspecified) { return }
+
+    $asUtc   = [datetime]::SpecifyKind($Raw, [System.DateTimeKind]::Utc)
+    $asLocal = [datetime]::SpecifyKind($Raw, [System.DateTimeKind]::Local).ToUniversalTime()
+    $dUtc    = [Math]::Abs(($asUtc   - $RequestedEndUtc).TotalMinutes)
+    $dLocal  = [Math]::Abs(($asLocal - $RequestedEndUtc).TotalMinutes)
+
+    # Neither reading lands near what we asked for, so this is not the window we
+    # set - a failed extend, or somebody amended it. Says nothing about kind.
+    if ([Math]::Min($dUtc, $dLocal) -gt 10) { return }
+
+    # The two readings agree, so the server runs on UTC and the distinction does
+    # not exist here. Latch anyway, to stop re-testing every sweep.
+    if ([Math]::Abs($dUtc - $dLocal) -lt 1) { $script:MmWindowKind = 'Utc'; return }
+
+    $script:MmWindowKind = $(if ($dLocal -lt $dUtc) { 'Local' } else { 'Utc' })
+    Write-Log ("Maintenance window end times come back with an unspecified DateTimeKind; calibrated against a window this script set as {0} time." -f
+               $script:MmWindowKind)
+}
+
+# Current maintenance window end, in UTC, or $null if it cannot be established.
+# $null means "cannot confirm" and must never be read as "not extended".
+#
+# CalibrateAgainstUtc is the end time we just asked SCOM for, when the caller
+# has one. It is used only to settle the Unspecified-kind question above.
+function Get-MaintenanceEndUtc {
+    param($Instance, [datetime]$CalibrateAgainstUtc = [datetime]::MinValue)
+    if (-not $Instance -or -not $Instance.InMaintenanceMode) { return $null }
+    if ($script:MmWindowReadable -eq $false) { return $null }
+
+    $why = $null
+    try {
+        $w = $Instance.GetMaintenanceWindow()
+        if ($null -eq $w) {
+            $why = 'GetMaintenanceWindow() returned nothing for an object that is in maintenance mode'
+        } else {
+            $e = $w.ScheduledEndTime
+            if ($e -is [datetime]) {
+                $script:MmWindowReadable = $true
+                if ($e.Kind -eq [System.DateTimeKind]::Local) { return $e.ToUniversalTime() }
+                if ($e.Kind -eq [System.DateTimeKind]::Utc)   { return $e }
+
+                # Unspecified. Settle it if the caller handed us a window of our
+                # own to compare against.
+                if ($CalibrateAgainstUtc -gt [datetime]::MinValue) {
+                    Register-MaintenanceWindowKind -Raw $e -RequestedEndUtc $CalibrateAgainstUtc
+                }
+                if ($script:MmWindowKind -eq 'Local') {
+                    return [datetime]::SpecifyKind($e, [System.DateTimeKind]::Local).ToUniversalTime()
+                }
+                # Uncalibrated: assume UTC, exactly as this did unconditionally
+                # before - but say so once, so an unexplained reapply cycle has
+                # something in the log to point at.
+                if (-not $script:MmWindowKindWarned) {
+                    $script:MmWindowKindWarned = $true
+                    Write-Log ("Maintenance window end times carry an unspecified DateTimeKind (first seen {0:yyyy-MM-dd HH:mm:ss}); treating them as UTC until a window this script set can settle it." -f $e) 'WARN'
+                }
+                return [datetime]::SpecifyKind($e, [System.DateTimeKind]::Utc)
+            }
+            $why = 'ScheduledEndTime is not a DateTime on this SDK build'
+        }
+    } catch {
+        $why = $_.Exception.Message
+    }
+
+    # Degrade to the old behaviour - confirm by InMaintenanceMode alone - rather
+    # than churning an extend every sweep for a window we simply cannot read.
+    if ($null -eq $script:MmWindowReadable) {
+        $script:MmWindowReadable = $false
+        Write-Log "Maintenance window end times are not readable here ($why); extends will be confirmed by InMaintenanceMode alone." 'WARN'
+    }
+    return $null
+}
+
+# Who set the maintenance window this object is in: 'Ours', 'Foreign', or
+# 'Unknown'. Decided by looking for $Marker in the window comment.
+#
+# THE FAILURE DIRECTION IS DELIBERATE. Anything we cannot positively read as
+# somebody else's comes back 'Unknown', and every caller treats 'Unknown'
+# exactly as it treated the world before ownership existed - it extends and it
+# releases. If this returned 'Foreign' on an unreadable comment, an SDK build
+# that does not surface window comments would stop the script extending or
+# releasing ANY machine: the tracked population would climb to TrackedCeiling
+# and the estate would go blind, which is the precise runaway the ceiling guard
+# exists to catch. Under-detecting costs an administrator an argument. The other
+# way round costs the monitoring.
+function Get-MaintenanceOwner {
+    param($Instance)
+    if (-not $Instance -or -not $Instance.InMaintenanceMode) { return 'Unknown' }
+
+    # A window put there by this script's own CHANGE mode is foreign to the
+    # shutdown side: never extended, never released, and a machine that comes
+    # back is dropped from tracking with the window left in place. Decided from
+    # our own state file rather than the window comment, so it holds even on an
+    # SDK build where comments cannot be read - which is exactly the case where
+    # the Unknown fallback below would otherwise claim the window as ours.
+    if (Test-ChangeWindow -InstanceId $Instance.Id) { return 'Foreign' }
+
+    if ($script:MmCommentReadable -eq $false)                { return 'Unknown' }
+
+    $why = $null
+    try {
+        $w = $Instance.GetMaintenanceWindow()
+        if ($null -eq $w) {
+            $why = 'GetMaintenanceWindow() returned nothing for an object that is in maintenance mode'
+        } else {
+            # Property name differs across SDK versions; missing members read as
+            # $null in PowerShell rather than throwing, so trying both is safe.
+            $c = $w.Comments
+            if ($null -eq $c) { $c = $w.Comment }
+
+            if ([string]::IsNullOrWhiteSpace([string]$c)) {
+                # Every window this script sets carries $Marker, so once this SDK
+                # has shown it DOES surface comments, a blank one cannot be ours.
+                if ($script:MmCommentReadable -eq $true) { return 'Foreign' }
+
+                # Until then a blank is no evidence either way - an administrator
+                # leaving it empty, or an SDK that never fills it in. It must NOT
+                # fall through to the latch below: that used to switch ownership
+                # off for the whole run whenever the first window read was blank.
+                return 'Unknown'
+            } else {
+                $script:MmCommentReadable = $true
+                if ([string]$c -like "*$Marker*") { return 'Ours' }
+                return 'Foreign'
+            }
+        }
+    } catch {
+        $why = $_.Exception.Message
+    }
+
+    if ($null -eq $script:MmCommentReadable) {
+        $script:MmCommentReadable = $false
+        Write-Log "Maintenance window ownership cannot be determined here ($why); every window will be treated as this script's own, exactly as before." 'WARN'
+    }
+    return 'Unknown'
+}
+
+# Re-reads an extend set from SCOM and advances Row.EndUtc ONLY for machines
+# whose window demonstrably moved. Returns the ones still unconfirmed.
+#
+# The old code set $extended once and then stamped the new EndUtc on every row
+# in the set, including rows Get-SCOMMaintenanceMode never returned an entry
+# for. That is the same failure the per-instance path warns about: the state
+# file claims a window the machine does not have, and nothing notices until the
+# real one lapses.
+function Confirm-Extended {
+    param([object[]]$Candidates, [datetime]$NewEndUtc)
+
+    $out = New-Object System.Collections.Generic.List[object]
+    if (-not $Candidates -or $Candidates.Count -eq 0) { return $out.ToArray() }
+
+    # An extend read on the same tick as the write can still show the old end
+    # time, which sends the machine down the per-instance retry path and, if it
+    # reads stale twice, logs a failure on an extend that worked.
+    #
+    # So read FIRST and pay the settle wait only for rows that have not moved.
+    # This runs inside the shutdown mutex, and a flat sleep here is time the
+    # APPLY loop cannot run. Rows confirmed on the first look never enter the
+    # second, so Row.EndUtc and Stats.Extended are written exactly once per row.
+    $tolerance = $NewEndUtc.AddMinutes(-5)
+    $round     = @($Candidates)
+    $fresh     = Get-InstanceMap -Ids @($round | ForEach-Object { $_.Row.InstanceId })
+
+    for ($attempt = 0; ; $attempt++) {
+        $out = New-Object System.Collections.Generic.List[object]
+        foreach ($t in $round) {
+            $f = $fresh[[string]$t.Row.InstanceId]
+            if (-not $f -or -not $f.InMaintenanceMode) { $out.Add($t); continue }
+
+            # This is the one place holding both a window and the end time we asked
+            # for, so it is where the Unspecified-kind question gets settled.
+            $end = Get-MaintenanceEndUtc -Instance $f -CalibrateAgainstUtc $NewEndUtc
+            if ($null -eq $end) {
+                if ($script:MmWindowReadable -eq $false) {
+                    # In MM is the most this SDK will prove. Trust it, as the old
+                    # code did unconditionally, but only for a machine we have just
+                    # confirmed really is in maintenance mode.
+                    $t.Row.EndUtc = $NewEndUtc.ToString('o')
+                    $script:Stats.Extended++
+                } else {
+                    $out.Add($t)
+                }
+                continue
+            }
+
+            if ($end -ge $tolerance) {
+                # Record the window SCOM actually holds, not the one we asked for.
+                $t.Row.EndUtc = $end.ToString('o')
+                $script:Stats.Extended++
+            } else {
+                $out.Add($t)
+            }
+        }
+
+        # Everything confirmed, the settle look is already spent, or settling is
+        # switched off: this is the answer. The per-instance attempt that follows
+        # a failed confirm IS the retry, and it is harmless to repeat.
+        if ($out.Count -eq 0 -or $attempt -ge 1 -or $VerifySettleMs -le 0) { return $out.ToArray() }
+
+        Write-Verbose "$($out.Count) extend(s) had not settled; re-reading after $VerifySettleMs ms."
+        $round = $out.ToArray()
+        Start-Sleep -Milliseconds $VerifySettleMs
+        $fresh = Get-InstanceMap -Ids @($round | ForEach-Object { $_.Row.InstanceId })
+    }
+}
+
+# Batched form of Resolve-WindowsComputer: one SDK round trip per 200 names
+# instead of one per alert. A MaxBatch burst used to cost MaxBatch round trips,
+# which was the last unbatched SDK call in the script.
+function Get-WindowsComputerMap {
+    param([string[]]$Fqdns)
+
+    $map   = @{}
+    $names = @($Fqdns | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    if ($names.Count -eq 0) { return $map }
+
+    $chunk = 200
+    for ($i = 0; $i -lt $names.Count; $i += $chunk) {
+        $slice = @($names[$i..([Math]::Min($i + $chunk, $names.Count) - 1)])
+
+        $found = @()
+        try {
+            $found = @(Get-SCOMClassInstance -Name $slice -ErrorAction SilentlyContinue)
+        } catch {
+            Write-Log "Batched Windows Computer lookup failed for a chunk of $($slice.Count), falling back per name: $($_.Exception.Message)" 'WARN'
+            foreach ($n in $slice) {
+                $c = Resolve-WindowsComputer -Fqdn $n
+                if ($c) { $map[$n] = $c }
+            }
+            continue
+        }
+
+        # Hashtable keys are case-insensitive, which is what the old -ieq
+        # comparison against DisplayName was doing.
+        $byName = @{}
+        foreach ($f in $found) {
+            if (-not $f -or [string]::IsNullOrWhiteSpace($f.DisplayName)) { continue }
+            if (-not $byName.ContainsKey($f.DisplayName)) {
+                $byName[$f.DisplayName] = New-Object System.Collections.Generic.List[object]
+            }
+            $byName[$f.DisplayName].Add($f)
+        }
+
+        # The fallback rule is the one place in this script that can select an
+        # object nobody intended, and until now it did so without leaving a
+        # trace. It is not being changed - it is being made visible, so that
+        # "which machine did it put into maintenance mode, and why that object"
+        # has an answer in the log instead of a theory.
+        $viaFallback = New-Object System.Collections.Generic.List[string]
+        $ambiguous   = New-Object System.Collections.Generic.List[string]
+
+        foreach ($n in $slice) {
+            $cands = $byName[$n]
+            if (-not $cands -or $cands.Count -eq 0) { continue }
+            # Same two selection rules as Resolve-WindowsComputer, in the same order.
+            $c = @($cands | Where-Object { $_.FullName -like 'Microsoft.Windows.Computer:*' }) | Select-Object -First 1
+            if (-not $c) {
+                $loose = @($cands | Where-Object { [string]::IsNullOrEmpty($_.Path) })
+                $c     = $loose | Select-Object -First 1
+                if ($c) {
+                    $viaFallback.Add($n)
+                    # More than one unhosted candidate: the first was taken, and
+                    # nothing here proves it is the Windows Computer.
+                    if ($loose.Count -gt 1) { $ambiguous.Add($n) }
+                }
+            }
+            if ($c) { $map[$n] = $c }
+        }
+
+        if ($viaFallback.Count -gt 0) {
+            Write-Log ("{0} name(s) matched no 'Microsoft.Windows.Computer:*' FullName and were resolved by the unhosted-object fallback: {1}{2}" -f
+                       $viaFallback.Count, ((@($viaFallback) | Select-Object -First 10) -join ', '),
+                       $(if ($viaFallback.Count -gt 10) { ', ...' } else { '' })) 'WARN'
+        }
+        if ($ambiguous.Count -gt 0) {
+            Write-Log ("{0} name(s) had MORE THAN ONE unhosted candidate; the first was taken and it may not be the Windows Computer object: {1}{2}" -f
+                       $ambiguous.Count, ((@($ambiguous) | Select-Object -First 10) -join ', '),
+                       $(if ($ambiguous.Count -gt 10) { ', ...' } else { '' })) 'ERROR'
+        }
+    }
+    return $map
+}
+
+# Applies MM to a set of instances. The caller verifies against SCOM before
+# trusting that it took.
+function Invoke-MaintenanceMode {
+    param([object[]]$Instances, [datetime]$EndUtc, [string]$Comment)
+    if (-not $Instances -or $Instances.Count -eq 0) { return }
+
+    if ($DryRun) {
+        foreach ($i in $Instances) { Write-Plan 'MM-APPLY' $i.DisplayName "until $EndUtc UTC" }
+        return
+    }
+
+    $startUtc = [datetime]::UtcNow
+    $targets  = $Instances
+
+    if (-not $UseSdkForApply) {
+        try {
+            # Cmdlet takes local time. Batched server-side.
+            Start-SCOMMaintenanceMode -Instance $targets -EndTime $EndUtc.ToLocalTime() `
+                -Reason PlannedOther -Comment $Comment
+            return
+        } catch {
+            Write-Log "Batched MM cmdlet failed, falling back per-instance: $($_.Exception.Message)" 'WARN'
+
+            # The batch may have applied to SOME of them before throwing.
+            # Calling ScheduleMaintenanceMode on an object already in MM throws,
+            # so re-read and skip those - otherwise a partial success turns into
+            # a pile of spurious ERRORs and a non-zero exit on a pass that
+            # mostly worked.
+            try {
+                $fresh = Get-InstanceMap -Ids @($targets | ForEach-Object { $_.Id.ToString() })
+                if ($fresh.Count -gt 0) {
+                    $remaining = @($targets | Where-Object {
+                        $f = $fresh[$_.Id.ToString()]
+                        -not ($f -and $f.InMaintenanceMode)
+                    })
+                    $skipped = $targets.Count - $remaining.Count
+                    if ($skipped -gt 0) {
+                        Write-Log "$skipped machine(s) were already in MM from the partial batch - skipping them in the fallback."
+                    }
+                    $targets = $remaining
+                }
+            } catch {
+                Write-Log "Could not re-read instances before the fallback: $($_.Exception.Message)" 'WARN'
+            }
+        }
+    }
+
+    foreach ($i in $targets) {
+        try {
+            # SDK takes UTC, and lets us name the traversal depth explicitly.
+            $i.ScheduleMaintenanceMode(
+                $startUtc, $EndUtc,
+                [Microsoft.EnterpriseManagement.Monitoring.MaintenanceModeReason]::PlannedOther,
+                $Comment,
+                [Microsoft.EnterpriseManagement.Common.TraversalDepth]::Recursive)
+        } catch {
+            Write-Log "MM failed for $($i.DisplayName): $($_.Exception.Message)" 'ERROR'
+        }
+    }
+}
+
+# ==========================================================================
+# Shared checks that decide whether anything is systemically wrong
+# ==========================================================================
+function Test-StateLoss {
+    param([int]$CurrentCount)
+    $state = Get-NotifyState
+    $last  = ConvertTo-Int $state['LastTrackedCount']
+
+    # Recovered from the backup. Still worth an email - something removed or
+    # corrupted the primary, and that wants explaining - but it is not the
+    # emergency the message below describes, because nothing was orphaned.
+    if ($script:StateRecoveredFrom) {
+        $body = @(
+            "The tracked-state file was missing or unreadable, and was rebuilt"
+            "from the backup written by the previous pass."
+            ""
+            "  Path       : $StateFile"
+            "  Recovered  : $CurrentCount machine(s) from $script:StateRecoveredFrom"
+            ""
+            "No machines were orphaned. At most one pass of changes was lost, and"
+            "the next sweep re-derives that from SCOM."
+            ""
+            "Worth finding out what removed or corrupted the primary file - a"
+            "backup agent, antivirus, a disk problem, or someone tidying up. If"
+            "the original was corrupt rather than missing it has been kept at"
+            "${StateFile}.corrupt."
+        ) -join "`r`n"
+
+        Send-Notification -Key 'StateRecovered' -Severity 'WARN' `
+            -Subject "Tracked-state file rebuilt from backup ($CurrentCount machines)" `
+            -Body $body -MinIntervalMinutes 1440
+        return
+    }
+
+    # A file that reads EMPTY is a legitimate drain. A file that has GONE, or
+    # will not parse, while we believed machines were suppressed, is loss:
+    # everything in it is now in MM and untracked until the window expires.
+    if (-not $script:StateFileExisted -and $last -ge $StateLossThreshold) {
+        $body = @(
+            "The tracked-state file is missing or unreadable."
+            ""
+            "  Path                          : $StateFile"
+            "  Machines tracked at last pass : $last"
+            ""
+            "Those machines are still in maintenance mode but are no longer"
+            "tracked, so nothing will release or extend them. They will surface"
+            "as normal heartbeat alerts within $MaintenanceHours hours when their"
+            "windows expire."
+            ""
+            "The backup at ${StateFile}.bak was tried automatically and could not"
+            "be used either - it is missing, empty, or unreadable. That is why"
+            "this is the serious message rather than the recovery one."
+        ) -join "`r`n"
+
+        Send-Notification -Key 'StateLoss' -Severity 'ERROR' `
+            -Subject "Tracked-state file lost ($last machines were suppressed)" `
+            -Body $body -MinIntervalMinutes 1440
+    }
+}
+
+function Update-TrackedCount {
+    param([int]$Count)
+    $state = Get-NotifyState
+    $state['LastTrackedCount'] = $Count
+    Set-NotifyState -State $state
+}
+
+function Test-SuppressionCeiling {
+    param([int]$TrackedCount, [int]$AppliedThisPass = 0)
+
+    if ($TrackedCount -ge $TrackedCeiling) {
+        $body = @(
+            "$TrackedCount machines are currently suppressed, at or above the"
+            "configured ceiling of $TrackedCeiling."
+            ""
+            "Suppression is now being REFUSED for anything above this ceiling,"
+            "so machines beyond it will alert normally. A spurious source of"
+            "Event 1074 alerts is the usual cause; a genuine outage larger than"
+            "the ceiling is the other."
+            ""
+            "Worth checking:"
+            "  - the '$AlertName' rule, for an unexpected volume of new alerts"
+            "  - whether a genuine site-wide outage is in progress"
+            "  - $StateFile for machines you do not expect to see"
+        ) -join "`r`n"
+
+        Send-Notification -Key 'RunawaySuppression' -Severity 'ERROR' `
+            -Subject "$TrackedCount machines suppressed (ceiling $TrackedCeiling)" `
+            -Body $body -MinIntervalMinutes 60
+    }
+
+    if ($ApplyBurstCeiling -gt 0 -and $AppliedThisPass -ge $ApplyBurstCeiling) {
+        $body = @(
+            "$AppliedThisPass machines entered maintenance mode in a single pass,"
+            "at or above the configured burst ceiling of $ApplyBurstCeiling."
+            ""
+            "Legitimate on a large planned shutdown. Worth a look if not."
+        ) -join "`r`n"
+
+        Send-Notification -Key 'ApplyBurst' -Severity 'WARN' `
+            -Subject "$AppliedThisPass machines suppressed in one pass" `
+            -Body $body -MinIntervalMinutes 60
+    }
+}
+
+function Test-MmFailureRate {
+    param([int]$Failed, [int]$Attempted, [string]$Phase)
+    if ($Failed -le 0) { return }
+
+    $systemic = ($Failed -ge $MmFailureAlertCount) -or
+                ($Attempted -ge 2 -and ($Failed / [double]$Attempted) -ge 0.5)
+    if (-not $systemic) { return }
+
+    $body = @(
+        "Maintenance mode failed for $Failed of $Attempted machine(s) during $Phase."
+        ""
+        "At this rate the cause is systemic rather than per-machine - the usual"
+        "suspects are the service account losing SCOM rights, the SDK service"
+        "being unavailable, or the config service being overloaded."
+        ""
+        "While this persists, gracefully shut down machines are NOT being"
+        "suppressed, which is the alert storm this script exists to prevent."
+        ""
+        "See $LogPath for the per-machine errors."
+    ) -join "`r`n"
+
+    Send-Notification -Key 'MmFailure' -Severity 'ERROR' `
+        -Subject "Maintenance mode failing wholesale ($Failed of $Attempted, $Phase)" `
+        -Body $body -MinIntervalMinutes 60
+}
+
+# ==========================================================================
+# SWEEP - release, extend, reapply, record
+# ==========================================================================
+function Invoke-SweepPass {
+    # First, so an unreadable exclusion file stops the pass before anything moves.
+    $exclusions = @(Get-ExclusionList)
+
+    # @() matters: with exactly one row tracked, Windows PowerShell 5.1 hands
+    # back a bare [pscustomobject], which has no .Count there.
+    $tracked = @(Get-TrackedState)
+    Test-StateLoss -CurrentCount $tracked.Count
+
+    if ($tracked.Count -eq 0) {
+        Write-Log 'Nothing currently suppressed.'
+        Update-TrackedCount -Count 0
+        $script:Stats.Tracked = 0
+        return
+    }
+
+    $nowUtc = [datetime]::UtcNow
+    $probe  = Test-AgentReachability -ComputerNames ($tracked.Fqdn)
+
+    # One batched fetch gives every tracked machine's current InMaintenanceMode,
+    # so lapsed windows are caught on the next sweep rather than up to 16 hours
+    # later when the state file happens to say the window is nearly up.
+    $instMap = Get-InstanceMap -Ids ($tracked.InstanceId)
+
+    # Diagnostic census of what the state file actually holds: row count,
+    # distinct FQDNs, and the classes behind the tracked InstanceIds. Free -
+    # $instMap is already in hand - and wrapped so it can never fail the pass.
+    try {
+        $distinctFqdn = @($tracked.Fqdn | Sort-Object -Unique).Count
+        if ($instMap.Count -gt 0) {
+            $byClass = @($instMap.Values |
+                         Group-Object { ($_.FullName -split ':')[0] } -NoElement |
+                         Sort-Object Count -Descending)
+            Write-Log ("Tracked census: {0} row(s), {1} distinct FQDN(s), {2} resolved - classes: {3}" -f
+                       $tracked.Count, $distinctFqdn, $instMap.Count,
+                       (($byClass | Select-Object -First 8 |
+                         ForEach-Object { '{0} x{1}' -f $_.Name, $_.Count }) -join ', '))
+        } else {
+            Write-Log ("Tracked census: {0} row(s), {1} distinct FQDN(s), none resolved in the management group." -f
+                       $tracked.Count, $distinctFqdn) 'WARN'
+        }
+    } catch {
+        Write-Log "Tracked census failed: $($_.Exception.Message)" 'WARN'
+    }
+
+    # Ownership, worked out up front in two rounds. A blank window comment only
+    # reads as foreign once some window has proved comments are readable here,
+    # so deciding row by row would judge a blank met early in the list on less
+    # evidence than one met late. Round two re-asks only the Unknowns.
+    $ownerOf = @{}
+    foreach ($row in $tracked) {
+        $i = $instMap[[string]$row.InstanceId]
+        if ($i -and $i.InMaintenanceMode) { $ownerOf[[string]$row.InstanceId] = Get-MaintenanceOwner -Instance $i }
+    }
+    if ($script:MmCommentReadable -eq $true) {
+        foreach ($k in @($ownerOf.Keys | Where-Object { $ownerOf[$_] -eq 'Unknown' })) {
+            $ownerOf[$k] = Get-MaintenanceOwner -Instance $instMap[$k]
+        }
+    }
+
+    $keep      = New-Object System.Collections.Generic.List[object]
+    $toRelease = New-Object System.Collections.Generic.List[object]
+    $toExtend  = New-Object System.Collections.Generic.List[object]
+    $toReapply = New-Object System.Collections.Generic.List[object]
+    $toReport  = New-Object System.Collections.Generic.List[object]
+    $heldForeign    = New-Object System.Collections.Generic.List[object]   # down, someone else's window
+    $droppedForeign = New-Object System.Collections.Generic.List[object]   # back up, someone else's window
+    $droppedExcluded = New-Object System.Collections.Generic.List[object]  # excluded, nothing of ours to undo
+    $pingOnly  = 0
+    $agentUp   = 0
+
+    foreach ($row in $tracked) {
+        $inst = $instMap[[string]$row.InstanceId]
+        if (-not $inst) {
+            Write-Log "$($row.Fqdn) no longer exists in the management group - dropped from tracking." 'WARN'
+            Add-EventRecord -Type 'InstanceVanished' -Fqdn $row.Fqdn -Detail $row.AppliedUtc
+            continue
+        }
+
+        $pingStreak  = ConvertTo-Int $row.PingStreak
+        $pingOnlyRun = ConvertTo-Int $row.PingOnlyStreak
+        $isUp        = $false
+        $viaPingOnly = $false
+
+        $p       = $probe[$row.Fqdn]
+        $pingOk  = ($p -and $p.Ping)
+        $agentOk = ($p -and $p.Agent)
+
+        # DNS is the decommissioning signal, and it was being computed and
+        # thrown away. A switched-off machine keeps its DNS record; a
+        # decommissioned one loses it. Stamped here, reported in the digest.
+        if ($p -and $p.Resolved) { $row.LastDnsOkUtc = $nowUtc.ToString('o') }
+
+        if ($agentOk) {
+            # Authoritative: the machine is up and HealthService is listening.
+            $isUp = $true; $pingStreak = 0; $pingOnlyRun = 0
+            $agentUp++
+        }
+        elseif ($pingOk) {
+            $pingStreak++
+            if ($SkipAgentPortCheck) {
+                $isUp = ($pingStreak -ge $PingStreakForRelease)
+            }
+            else {
+                $pingOnlyRun++
+                $pingOnly++
+                if ($pingOnlyRun -ge $ReleaseAfterPingOnlySweeps) {
+                    # Long past a plausible boot window. Release it: a live
+                    # machine whose agent is not listening is a real fault and
+                    # belongs in someone's queue, not hidden in maintenance mode.
+                    $isUp = $true; $viaPingOnly = $true
+                    Write-Log ("{0}: answers ping but nothing on TCP {1} after {2} sweeps - releasing so the agent fault surfaces." -f
+                               $row.Fqdn, $AgentPort, $pingOnlyRun) 'WARN'
+                } else {
+                    Write-Verbose ("{0}: pings but not TCP {1} (sweep {2} of {3}) - probably still booting, staying suppressed." -f
+                                   $row.Fqdn, $AgentPort, $pingOnlyRun, $ReleaseAfterPingOnlySweeps)
+                }
+            }
+        }
+        else {
+            $pingStreak = 0; $pingOnlyRun = 0
+        }
+
+        $row.PingStreak     = $pingStreak
+        $row.PingOnlyStreak = $pingOnlyRun
+
+        # Whose window is this? Only meaningful while the object is actually in
+        # one; if it is not, the reapply path below is about to make it ours.
+        $owner   = if ($inst.InMaintenanceMode) { $ownerOf[[string]$row.InstanceId] } else { 'Ours' }
+        $foreign = ($owner -eq 'Foreign')
+
+        if ($foreign) {
+            if ([string]::IsNullOrWhiteSpace([string]$row.ForeignSinceUtc)) {
+                $row.ForeignSinceUtc = $nowUtc.ToString('o')
+                Write-Log ("{0} is in a maintenance window this script did not set - leaving it alone." -f $row.Fqdn) 'WARN'
+                Add-EventRecord -Type 'ForeignMm' -Fqdn $row.Fqdn -Detail 'detected'
+            }
+        } else {
+            # Back under our management (or never left it).
+            $row.ForeignSinceUtc = ''
+        }
+
+        # On the exclusion list - added after this machine was suppressed. It
+        # must not sit in maintenance mode, so take it out of OUR window whether
+        # it is up or not (released first, ahead of the MaxReleaseBatch cap).
+        # Someone else's window is still theirs. Either way, stop tracking it:
+        # never extended, never reapplied.
+        $hit = Get-ExclusionMatch -Fqdn $row.Fqdn -Exclusions $exclusions
+        if ($hit) {
+            if ($inst.InMaintenanceMode -and -not $foreign) {
+                $toRelease.Insert(0, [pscustomobject]@{ Row = $row; Instance = $inst; ViaPingOnly = $false; Excluded = $hit })
+            } else {
+                $droppedExcluded.Add([pscustomobject]@{ Row = $row; Excluded = $hit
+                                                        Why = $(if ($foreign) { "in a window this script did not set - left in place" } else { "not in maintenance mode" }) })
+            }
+            continue
+        }
+
+        if ($isUp) {
+            if ($foreign) {
+                # The machine is back AND someone else owns the window. Calling
+                # StopMaintenanceMode here would pull it out of a window an
+                # administrator set deliberately. There is nothing left for this
+                # script to do for it, so it stops tracking it instead.
+                $droppedForeign.Add($row)
+                Add-EventRecord -Type 'ForeignRelease' -Fqdn $row.Fqdn -Detail 'back up, left in place'
+                continue
+            }
+            $toRelease.Add([pscustomobject]@{ Row = $row; Instance = $inst; ViaPingOnly = $viaPingOnly; Excluded = $null })
+            continue
+        }
+
+        # Still down. Report it if it has been dormant a long time.
+        $appliedUtc = ConvertTo-Utc $row.AppliedUtc
+        if ($appliedUtc -and ($nowUtc - $appliedUtc).TotalDays -ge $ReviewAfterDays) {
+            $lastReported = ConvertTo-Utc $row.LastReportedUtc
+            if (-not $lastReported -or ($nowUtc - $lastReported).TotalDays -ge $ReportEveryDays) {
+                $lastDns = ConvertTo-Utc $row.LastDnsOkUtc
+                $toReport.Add([pscustomobject]@{
+                    ReportedUtc = $nowUtc.ToString('o')
+                    Fqdn        = $row.Fqdn
+                    DownSince   = $row.AppliedUtc
+                    DaysDown    = [math]::Round(($nowUtc - $appliedUtc).TotalDays, 1)
+                    DaysNoDns   = $(if ($lastDns) { [math]::Round(($nowUtc - $lastDns).TotalDays, 1) } else { 'never resolved' })
+                })
+                $row.LastReportedUtc = $nowUtc.ToString('o')
+            }
+        }
+
+        if (-not $inst.InMaintenanceMode) {
+            # MM lapsed, or was ended by hand, while the machine is still down.
+            # If a foreign window is what lapsed, management resumes here - which
+            # is the whole reason a hands-off machine stays tracked.
+            $toReapply.Add([pscustomobject]@{ Row = $row; Instance = $inst })
+        } elseif ($foreign) {
+            # Still down, still in someone else's window. No extend: pushing the
+            # end time out would overwrite whatever they set it to.
+            $heldForeign.Add($row)
+        } else {
+            $endUtc = ConvertTo-Utc $row.EndUtc
+            if (-not $endUtc -or ($endUtc - $nowUtc).TotalHours -le $ExtendWhenWithinHours) {
+                $toExtend.Add([pscustomobject]@{ Row = $row; Instance = $inst })
+            }
+        }
+
+        $keep.Add($row)
+    }
+
+    # --- Dry run stops here ------------------------------------------------
+    # Everything above is read-only: the reachability probe, the instance
+    # fetch, the ownership check. Everything below changes SCOM or the state
+    # files. One gate, rather than a condition at each of the eight mutation
+    # points, so there is no path that can half-apply.
+    if ($DryRun) {
+        $newEnd = $nowUtc.AddHours($MaintenanceHours)
+        foreach ($t in $toRelease) {
+            if ($t.Excluded) {
+                Write-Plan 'RELEASE' $t.Row.Fqdn "on the exclusion list ('$($t.Excluded)') - out of this script's window, then untracked"
+                continue
+            }
+            $ap = ConvertTo-Utc $t.Row.AppliedUtc
+            $d  = if ($ap) { [math]::Round(($nowUtc - $ap).TotalDays, 2) } else { 0 }
+            Write-Plan 'RELEASE' $t.Row.Fqdn ("agent answered; down $d days" + $(if ($t.ViaPingOnly) { ' (ping-only fallback)' } else { '' }))
+        }
+        foreach ($x in $droppedExcluded) { Write-Plan 'UNTRACK' $x.Row.Fqdn "on the exclusion list ('$($x.Excluded)'), $($x.Why)" }
+        foreach ($t in $toExtend)  { Write-Plan 'EXTEND'  $t.Row.Fqdn "window to $($newEnd.ToString('u'))" }
+        foreach ($t in $toReapply) { Write-Plan 'REAPPLY' $t.Row.Fqdn "maintenance mode has lapsed while still down" }
+        foreach ($r in $heldForeign)    { Write-Plan 'HANDS-OFF' $r.Fqdn "still down, in a window this script did not set" }
+        foreach ($r in $droppedForeign) { Write-Plan 'UNTRACK'   $r.Fqdn "back up, but in a window this script did not set - left in place" }
+        foreach ($m in $toReport)  { Write-Plan 'REVIEW'  $m.Fqdn "dormant $($m.DaysDown) days" }
+
+        $noChange = $keep.Count - $toExtend.Count - $toReapply.Count - $heldForeign.Count
+        Write-Log ("DRYRUN SWEEP: {0} tracked - {1} release, {2} extend, {3} reapply, {4} hands off, {5} untrack, {6} no change. Nothing was changed." -f
+                   $tracked.Count, $toRelease.Count, $toExtend.Count, $toReapply.Count,
+                   $heldForeign.Count, ($droppedForeign.Count + $droppedExcluded.Count), [Math]::Max(0, $noChange))
+        $script:Stats.Tracked = $tracked.Count
+        return
+    }
+
+    # --- Excluded, nothing to undo -----------------------------------------
+    foreach ($x in $droppedExcluded) {
+        Write-Log ("{0} is on the exclusion list ('{1}') - dropped from tracking; {2}." -f $x.Row.Fqdn, $x.Excluded, $x.Why) 'WARN'
+        Add-EventRecord -Type 'ExcludedUntracked' -Fqdn $x.Row.Fqdn -Detail $x.Excluded
+    }
+
+    # --- Release -----------------------------------------------------------
+    # There is no Stop-SCOMMaintenanceMode cmdlet, and no bulk stop. Per object.
+    # Capped, because Monday morning is the mass event: hundreds returning at
+    # once, each stop triggering config recalculation.
+    if ($toRelease.Count -gt 0) {
+        $deferred = @()
+        if ($toRelease.Count -gt $MaxReleaseBatch) {
+            Write-Log "$($toRelease.Count) machine(s) ready to release; taking $MaxReleaseBatch this sweep." 'WARN'
+            $deferred  = @($toRelease[$MaxReleaseBatch..($toRelease.Count - 1)])
+            $toRelease = [System.Collections.Generic.List[object]]@($toRelease[0..($MaxReleaseBatch - 1)])
+        }
+        foreach ($d in $deferred) { $keep.Add($d.Row) }   # retry next sweep
+
+        $stopUtc    = [datetime]::UtcNow
+        $stopCalled = New-Object System.Collections.Generic.List[object]
+        foreach ($t in $toRelease) {
+            if (-not $t.Instance.InMaintenanceMode) {
+                # Already out by this instance's reckoning - but the handle is
+                # from the top of the sweep, so it still goes through the
+                # verification below rather than being dropped on trust.
+                $stopCalled.Add($t)
+                continue
+            }
+            try {
+                $t.Instance.StopMaintenanceMode(
+                    $stopUtc,
+                    [Microsoft.EnterpriseManagement.Common.TraversalDepth]::Recursive)
+                $stopCalled.Add($t)
+            } catch {
+                Write-Log "Release failed for $($t.Row.Fqdn): $($_.Exception.Message)" 'ERROR'
+                $keep.Add($t.Row)          # keep tracking it, retry next sweep
+            }
+        }
+
+        # Verify, the way apply and reapply already do. Release was the one
+        # operation taking "did not throw" as proof. A stop that silently does
+        # not take drops the machine from tracking while it is still in
+        # maintenance mode - blind for the rest of the window, with nothing
+        # left watching it and no retry.
+        $released   = New-Object System.Collections.Generic.List[string]
+        $stopFailed = 0
+        if ($stopCalled.Count -gt 0) {
+            $check = Get-VerifiedInstanceMap -ExpectInMaintenanceMode $false `
+                         -Ids @($stopCalled | ForEach-Object { $_.Row.InstanceId })
+            foreach ($t in $stopCalled) {
+                $fresh = $check[[string]$t.Row.InstanceId]
+                if ($fresh -and $fresh.InMaintenanceMode) {
+                    Write-Log "Release did not take for $($t.Row.Fqdn) - still in maintenance mode; kept tracked for the next sweep." 'ERROR'
+                    Add-EventRecord -Type 'MmFailed' -Fqdn $t.Row.Fqdn -Detail 'release'
+                    $keep.Add($t.Row)
+                    $stopFailed++
+                    continue
+                }
+
+                # Out of MM, or gone from the management group entirely. Either
+                # way it is no longer suppressed and no longer ours to track.
+                $released.Add($t.Row.Fqdn)
+                if ($t.Excluded) {
+                    # Not a return from outage - it may well still be down - so
+                    # kept out of the Released records the digest averages.
+                    Write-Log ("{0} is on the exclusion list ('{1}') - taken out of maintenance mode and dropped from tracking." -f $t.Row.Fqdn, $t.Excluded) 'WARN'
+                    Add-EventRecord -Type 'ExcludedRelease' -Fqdn $t.Row.Fqdn -Detail $t.Excluded
+                    continue
+                }
+                $appliedUtc = ConvertTo-Utc $t.Row.AppliedUtc
+                $days = if ($appliedUtc) { [math]::Round(($stopUtc - $appliedUtc).TotalDays, 2) } else { 0 }
+                Add-EventRecord -Type $(if ($t.ViaPingOnly) { 'PingOnlyRelease' } else { 'Released' }) `
+                                -Fqdn $t.Row.Fqdn -Detail $days
+            }
+            $script:Stats.MmFailures += $stopFailed
+            Test-MmFailureRate -Failed $stopFailed -Attempted $stopCalled.Count -Phase 'release'
+        }
+
+        if ($released.Count -gt 0) {
+            $script:Stats.Released += $released.Count
+            Write-Log "Released MM for $($released.Count): $(($released | Select-Object -First 20) -join ', ')"
+        }
+    }
+
+    # --- Extend ------------------------------------------------------------
+    if ($toExtend.Count -gt 0) {
+        $newEnd  = $nowUtc.AddHours($MaintenanceHours)
+        $pending = $toExtend.ToArray()
+
+        # --- Attempt 1: the batched cmdlet ---------------------------------
+        # Chunked, because the extend set can be most of the tracked population
+        # and this was the last unbounded SDK call left in the sweep.
+        try {
+            # Set-SCOMMaintenanceMode takes MaintenanceWindow entries, NOT instances.
+            $instances = @($pending | ForEach-Object { $_.Instance })
+            $chunk     = 200
+            for ($i = 0; $i -lt $instances.Count; $i += $chunk) {
+                $slice   = @($instances[$i..([Math]::Min($i + $chunk, $instances.Count) - 1)])
+                $entries = @(Get-SCOMMaintenanceMode -Instance $slice -ErrorAction SilentlyContinue)
+                if ($entries.Count -eq 0) {
+                    Write-Log "No active MM entries returned for a chunk of $($slice.Count) - those fall through to the per-instance path." 'WARN'
+                    continue
+                }
+                Set-SCOMMaintenanceMode -MaintenanceModeEntry $entries -EndTime $newEnd.ToLocalTime() `
+                    -Comment "$Marker - still down, window extended"
+            }
+        } catch {
+            Write-Log "Batch extend failed, falling back per-instance: $($_.Exception.Message)" 'WARN'
+        }
+
+        # Only rows whose window demonstrably moved get their EndUtc advanced.
+        $pending   = @(Confirm-Extended -Candidates $pending -NewEndUtc $newEnd)
+        $confirmed = $toExtend.Count - $pending.Count
+        if ($confirmed -gt 0) {
+            Write-Log "Extended MM for $confirmed machine(s) to $newEnd UTC."
+        }
+
+        # --- Attempt 2: per-instance, only for what the batch did not take --
+        if ($pending.Count -gt 0) {
+            Write-Log "Batch extend confirmed $confirmed of $($toExtend.Count); retrying $($pending.Count) per-instance." 'WARN'
+            foreach ($t in $pending) {
+                try {
+                    # SDK method, UTC.
+                    $t.Instance.UpdateMaintenanceMode(
+                        $newEnd,
+                        [Microsoft.EnterpriseManagement.Monitoring.MaintenanceModeReason]::PlannedOther,
+                        "$Marker - still down, window extended",
+                        [Microsoft.EnterpriseManagement.Common.TraversalDepth]::Recursive)
+                } catch {
+                    Write-Log "Extend failed for $($t.Row.Fqdn): $($_.Exception.Message)" 'ERROR'
+                }
+            }
+
+            # Still only the confirmed ones get a new EndUtc. Advancing it on a
+            # failed extend hides the machine for another window while its real
+            # MM quietly expires - which is exactly what the batch path used to
+            # do to every machine in the set.
+            $stillPending = @(Confirm-Extended -Candidates $pending -NewEndUtc $newEnd)
+            foreach ($t in $stillPending) {
+                Write-Log "Extend did not take for $($t.Row.Fqdn) - EndUtc left as-is so the next sweep retries." 'ERROR'
+                Add-EventRecord -Type 'MmFailed' -Fqdn $t.Row.Fqdn -Detail 'extend'
+            }
+            if ($stillPending.Count -gt 0) {
+                $script:Stats.MmFailures += $stillPending.Count
+                Test-MmFailureRate -Failed $stillPending.Count -Attempted $toExtend.Count -Phase 'extend'
+            }
+        }
+    }
+
+    # --- Reapply lapsed ----------------------------------------------------
+    if ($toReapply.Count -gt 0) {
+        $newEnd = $nowUtc.AddHours($MaintenanceHours)
+        Write-Log "Re-applying lapsed MM for $($toReapply.Count) machine(s)." 'WARN'
+        Invoke-MaintenanceMode -Instances @($toReapply.Instance) -EndUtc $newEnd `
+            -Comment "$Marker - reapplied, still down"
+
+        $check  = Get-VerifiedInstanceMap -ExpectInMaintenanceMode $true -Ids @($toReapply.Row.InstanceId)
+        $failed = 0
+        foreach ($t in $toReapply) {
+            $fresh = $check[[string]$t.Row.InstanceId]
+            if ($fresh -and $fresh.InMaintenanceMode) {
+                $t.Row.EndUtc = $newEnd.ToString('o')
+                $script:Stats.Reapplied++
+                Add-EventRecord -Type 'Reapplied' -Fqdn $t.Row.Fqdn
+            } else {
+                Write-Log "Reapply did not take for $($t.Row.Fqdn) - will retry next sweep." 'ERROR'
+                Add-EventRecord -Type 'MmFailed' -Fqdn $t.Row.Fqdn -Detail 'reapply'
+                $t.Row.EndUtc = ''      # force another attempt next sweep
+                $failed++
+            }
+        }
+        $script:Stats.MmFailures += $failed
+        Test-MmFailureRate -Failed $failed -Attempted $toReapply.Count -Phase 'reapply'
+    }
+
+    # --- Foreign windows ---------------------------------------------------
+    if ($heldForeign.Count -gt 0 -or $droppedForeign.Count -gt 0) {
+        Write-Log ("{0} machine(s) left alone in maintenance windows this script did not set; {1} dropped from tracking after coming back." -f
+                   $heldForeign.Count, $droppedForeign.Count) 'WARN'
+    }
+
+    # --- Port-probe sanity -------------------------------------------------
+    $script:Stats.PingOnly += $pingOnly
+    if ($pingOnly -gt 0) {
+        Write-Log ("{0} machine(s) answered ping with nothing listening on TCP {1} this sweep." -f
+                   $pingOnly, $AgentPort) 'WARN'
+
+        # Denominator is machines that ANSWERED this sweep, not everything
+        # tracked. Machines that are genuinely down do not answer ping at all,
+        # so measuring against the whole tracked population made this guard
+        # essentially unfireable: 20 ping-only out of 300 tracked is 7%, nowhere
+        # near the ratio, even with the port firewalled shut estate-wide.
+        $answered = $pingOnly + $agentUp
+        if ($answered -ge 10 -and ($pingOnly / [double]$answered) -ge $PortBlindRatio) {
+            $pct = [math]::Round(100 * $pingOnly / [double]$answered)
+            $body = @(
+                "$pingOnly of the $answered tracked machines that answered ping this"
+                "sweep ($pct%) had nothing listening on TCP $AgentPort."
+                ""
+                "At that proportion the likely cause is the port being blocked"
+                "between this management server and the agents - a firewall or"
+                "GPO change - rather than that many agents genuinely being down."
+                ""
+                "Effect while this persists: machines that have come back stay"
+                "suppressed for $ReleaseAfterPingOnlySweeps sweeps before being"
+                "released on the fallback rule, so live machines are briefly"
+                "invisible to monitoring."
+                ""
+                "Workaround if the port cannot be reopened quickly:"
+                "  add -SkipAgentPortCheck to the SWEEP task (release then falls"
+                "  back to $PingStreakForRelease consecutive pings)."
+            ) -join "`r`n"
+
+            Send-Notification -Key 'PortBlind' -Severity 'WARN' `
+                -Subject "TCP $AgentPort unreachable for $pct% of suppressed machines" `
+                -Body $body -MinIntervalMinutes 1440
+        }
+    }
+
+    # --- Dormant report ----------------------------------------------------
+    if ($toReport.Count -gt 0) {
+        try {
+            New-ParentDirectory -Path $ReportPath
+            if (Test-Path $ReportPath) {
+                # The row shape gained ReportedUtc and DaysNoDns. Export-Csv
+                # -Append refuses a header mismatch, so retire an old-schema
+                # file once rather than failing this report on every sweep.
+                $head = @(Get-Content -Path $ReportPath -TotalCount 1)
+                if ($head.Count -gt 0 -and $head[0] -notmatch 'ReportedUtc') {
+                    Move-Item -Path $ReportPath -Destination "$ReportPath.old" -Force
+                    Write-Log "Dormant report was on the old schema - moved to ${ReportPath}.old and started a new one." 'WARN'
+                }
+            }
+            $toReport | Export-Csv -Path $ReportPath -NoTypeInformation -Append
+        } catch {
+            Write-Log "Could not append to the dormant report: $($_.Exception.Message)" 'WARN'
+        }
+        foreach ($m in $toReport) {
+            Write-Log "REVIEW: $($m.Fqdn) suppressed for $($m.DaysDown) days - decommissioned?" 'WARN'
+        }
+        # Emitted to stdout so the scheduled task output can be mailed on.
+        $toReport | Format-Table -AutoSize | Out-String | Write-Output
+    }
+
+    Set-TrackedState -Rows $keep
+    Update-TrackedCount -Count $keep.Count
+    $script:Stats.Tracked = $keep.Count
+    Test-SuppressionCeiling -TrackedCount $keep.Count
+}
+
+# ==========================================================================
+# APPLY - pick up new shutdown alerts
+# ==========================================================================
+function Invoke-ApplyPass {
+    # First, so an unreadable exclusion file stops the pass before anything moves.
+    $exclusions = @(Get-ExclusionList)
+
+    $sinceUtc = [datetime]::UtcNow.AddMinutes(-$LookbackMinutes)
+    # Round-trip format. The short 'yyyy-MM-ddTHH:mm:ssZ' form is the usual
+    # cause of a criteria parse failure here.
+    $stamp    = $sinceUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffffffZ')
+    $safeName = $AlertName -replace "'", "''"
+
+    # Server-side criteria. Never replace this with Get-SCOMAlert | Where-Object;
+    # on this management group that drags back every open alert in the estate.
+    $criteria = "Name = '$safeName' AND ResolutionState = 0 AND TimeRaised >= '$stamp'"
+
+    try {
+        # Sorted, because Get-SCOMAlert makes no ordering promise and MaxBatch
+        # slicing an unordered set can starve the same alerts every pass until
+        # they age out of the lookback and are lost for good.
+        $alerts = @(Get-SCOMAlert -Criteria $criteria | Sort-Object TimeRaised)
+    } catch {
+        Write-Log "Alert query failed (check the TimeRaised format): $($_.Exception.Message)" 'ERROR'
+        return
+    }
+
+    $tracked = [System.Collections.ArrayList]@(Get-TrackedState)
+    Test-StateLoss -CurrentCount $tracked.Count
+    $script:Stats.Tracked = $tracked.Count
+
+    if ($alerts.Count -eq 0) {
+        Write-Log 'No new shutdown alerts.'
+        Update-TrackedCount -Count $tracked.Count
+        Test-SuppressionCeiling -TrackedCount $tracked.Count
+        return
+    }
+    if ($alerts.Count -gt $MaxBatch) {
+        Write-Log "$($alerts.Count) shutdown alerts pending; taking the $MaxBatch oldest this pass." 'WARN'
+        $alerts = $alerts[0..($MaxBatch - 1)]
+    }
+
+    $known = @{}
+    foreach ($t in $tracked) { $known[$t.Fqdn] = $true }
+
+    $candidates = New-Object System.Collections.Generic.List[object]   # need MM
+    $alreadyMM  = New-Object System.Collections.Generic.List[object]   # track only
+    $closeOnly  = New-Object System.Collections.Generic.List[object]   # dupes
+
+    $notifyState   = Get-NotifyState
+    $orphanTouched = $false
+
+    # Name every alert first, so the Windows Computer lookup can be batched.
+    # It used to be one SDK round trip per alert, which at MaxBatch was 100
+    # sequential round trips on the pass that could least afford them.
+    $pairs = New-Object System.Collections.Generic.List[object]
+    foreach ($alert in $alerts) {
+        # PrincipalName carries the agent FQDN. NetbiosDomainName is the NetBIOS
+        # domain, so composing with it yields SERVER01.CONTOSO, not the FQDN.
+        $fqdn = $alert.PrincipalName
+        if ([string]::IsNullOrWhiteSpace($fqdn)) {
+            if ([string]::IsNullOrWhiteSpace($alert.NetbiosComputerName)) {
+                Write-Log "Alert $($alert.Id) carries no computer name - skipped." 'WARN'
+                continue
+            }
+            $fqdn = if ($alert.NetbiosDomainName) {
+                        '{0}.{1}' -f $alert.NetbiosComputerName, $alert.NetbiosDomainName
+                    } else { $alert.NetbiosComputerName }
+            Write-Log "Alert $($alert.Id) had no PrincipalName; composed '$fqdn' from NetBIOS names." 'WARN'
+        }
+        $pairs.Add([pscustomobject]@{ Fqdn = $fqdn; Alert = $alert })
+    }
+
+    # Excluded machines are not touched at all: no maintenance mode, not
+    # tracked, and the alert is left OPEN so the shutdown shows in the console.
+    # It is re-seen every pass for the lookback, so it is logged once per
+    # invocation and recorded in the event history at most once a day.
+    $excluded = New-Object System.Collections.Generic.List[object]
+    if ($exclusions.Count -gt 0) {
+        $rest = New-Object System.Collections.Generic.List[object]
+        foreach ($p in $pairs) {
+            $hit = Get-ExclusionMatch -Fqdn $p.Fqdn -Exclusions $exclusions
+            if ($hit) { $excluded.Add([pscustomobject]@{ Fqdn = $p.Fqdn; Alert = $p.Alert; Entry = $hit }) }
+            else      { $rest.Add($p) }
+        }
+        $pairs = $rest
+    }
+    foreach ($x in $excluded) {
+        if ($script:ExcludedLogged.ContainsKey($x.Fqdn)) { continue }
+        $script:ExcludedLogged[$x.Fqdn] = $true
+        $script:Stats.Excluded++
+        Write-Log ("{0} shut down but is on the exclusion list ('{1}') - not put into maintenance mode; alert {2} left open." -f
+                   $x.Fqdn, $x.Entry, $x.Alert.Id) 'WARN'
+        $lastSeen = ConvertTo-Utc ([string]$notifyState['Excluded'][$x.Fqdn])
+        if (-not $lastSeen -or ([datetime]::UtcNow - $lastSeen).TotalHours -ge 24) {
+            Add-EventRecord -Type 'Excluded' -Fqdn $x.Fqdn -Detail $x.Entry
+            $notifyState['Excluded'][$x.Fqdn] = [datetime]::UtcNow.ToString('o')
+            $orphanTouched = $true      # same once-a-day map handling as orphans
+        }
+    }
+
+    # Only alerts for machines we are not already tracking need an instance.
+    $computerMap = Get-WindowsComputerMap -Fqdns @($pairs |
+                       Where-Object { -not $known[$_.Fqdn] } |
+                       ForEach-Object { $_.Fqdn })
+
+    foreach ($p in $pairs) {
+        $fqdn  = $p.Fqdn
+        $alert = $p.Alert
+
+        if ($known[$fqdn]) { $closeOnly.Add($alert); continue }   # already suppressed
+
+        $computer = $computerMap[$fqdn]
+        if (-not $computer) {
+            Write-Log "No Windows Computer instance found for '$fqdn' - skipped." 'WARN'
+            $script:Stats.Orphans++
+
+            # Record at most once a day per machine. The alert stays at
+            # resolution state 0 and is re-seen every pass for the whole
+            # lookback, so recording unconditionally would write hundreds of
+            # identical rows a day into the event history.
+            $lastSeen = ConvertTo-Utc ([string]$notifyState['Orphans'][$fqdn])
+            if (-not $lastSeen -or ([datetime]::UtcNow - $lastSeen).TotalHours -ge 24) {
+                Add-EventRecord -Type 'OrphanAlert' -Fqdn $fqdn -Detail "alert $($alert.Id)"
+                $notifyState['Orphans'][$fqdn] = [datetime]::UtcNow.ToString('o')
+                $orphanTouched = $true
+            }
+            continue
+        }
+
+        # Owner and EndUtc are filled in below: 'Ours' with the window we set
+        # for anything we put into MM ourselves, and whatever is actually there
+        # for anything that was already in it.
+        $entry = [pscustomobject]@{ Fqdn = $fqdn; Alert = $alert; Instance = $computer
+                                    Owner = 'Ours'; EndUtc = '' }
+        if ($computer.InMaintenanceMode) { $alreadyMM.Add($entry) } else { $candidates.Add($entry) }
+        $known[$fqdn] = $true
+    }
+
+    if ($orphanTouched) {
+        # Prune anything not seen for a month so this cannot grow forever.
+        $cut = [datetime]::UtcNow.AddDays(-30)
+        foreach ($map in @($notifyState['Orphans'], $notifyState['Excluded'])) {
+            foreach ($k in @($map.Keys)) {
+                $t = ConvertTo-Utc ([string]$map[$k])
+                if (-not $t -or $t -lt $cut) { $map.Remove($k) }
+            }
+        }
+        Set-NotifyState -State $notifyState
+    }
+
+    # A machine already in maintenance mode when its alert arrives is tracked,
+    # but that window is not one we set and its end is not the end we would have
+    # chosen. The old code stamped $endUtc on it anyway and cleared
+    # ForeignSinceUtc, so the state file asserted a window that might expire
+    # hours earlier than claimed, and the next sweep would happily EXTEND an
+    # administrator's window as though it were ours. Ask once, here, and record
+    # what is actually there - the dry run reads the same answers rather than
+    # working ownership out separately.
+    foreach ($e in $alreadyMM) {
+        $e.Owner = Get-MaintenanceOwner -Instance $e.Instance
+        $realEnd = Get-MaintenanceEndUtc -Instance $e.Instance
+        # Empty, not invented. The sweep reads a missing EndUtc as "due an
+        # extend", which is right for a window of ours and never consulted for
+        # a foreign one.
+        $e.EndUtc = $(if ($realEnd) { $realEnd.ToString('o') } else { '' })
+    }
+    # A blank comment only reads as foreign once some window has proved
+    # comments are readable; give any blank met before that proof a second look.
+    if ($script:MmCommentReadable -eq $true) {
+        foreach ($e in @($alreadyMM | Where-Object { $_.Owner -eq 'Unknown' })) {
+            $e.Owner = Get-MaintenanceOwner -Instance $e.Instance
+        }
+    }
+
+    $processed = New-Object System.Collections.Generic.List[object]
+    foreach ($a in $closeOnly) { $processed.Add($a) }
+
+    $endUtc  = [datetime]::UtcNow.AddHours($MaintenanceHours)
+    $applied = New-Object System.Collections.Generic.List[object]
+    foreach ($e in $alreadyMM) { $applied.Add($e) }
+
+    if ($DryRun) {
+        foreach ($x in $excluded) {
+            Write-Plan 'EXCLUDED' $x.Fqdn "on the exclusion list ('$($x.Entry)') - no maintenance mode, alert $($x.Alert.Id) left open"
+        }
+        foreach ($e in $candidates) {
+            Write-Plan 'ENTER-MM' $e.Fqdn "until $($endUtc.ToString('u')), then close alert $($e.Alert.Id)"
+        }
+        foreach ($e in $alreadyMM) {
+            $note = $(if ($e.Owner -eq 'Foreign') { "already in a window this script did not set" } else { "already in maintenance mode" })
+            $when = $(if ($e.EndUtc) { "window ends $((ConvertTo-Utc $e.EndUtc).ToString('u'))" } else { "window end not readable" })
+            Write-Plan 'TRACK-ONLY' $e.Fqdn "$note, $when; would track and close alert $($e.Alert.Id)"
+        }
+        Write-Log ("DRYRUN APPLY: {0} alert(s) in scope - {1} would enter maintenance mode, {2} already in it, {3} duplicate(s) closed, {4} orphan(s), {5} excluded. Nothing was changed." -f
+                   $alerts.Count, $candidates.Count, $alreadyMM.Count, $closeOnly.Count, $script:Stats.Orphans, $excluded.Count)
+        $script:Stats.Tracked = $tracked.Count
+        return
+    }
+
+    # ---- the ceiling is a fence, not a sign -------------------------------
+    # This used to warn and then carry on suppressing, which is the wrong way
+    # round for a script whose worst failure is blinding the monitoring while
+    # every log line still reads as success. Machines refused here keep their
+    # alert at resolution state 0, so they alert normally AND are retried next
+    # pass once the tracked population drops back below the ceiling.
+    if ($candidates.Count -gt 0) {
+        $headroom = $TrackedCeiling - $tracked.Count
+        if ($headroom -lt 0) { $headroom = 0 }
+
+        if ($candidates.Count -gt $headroom) {
+            $refused = $candidates.Count - $headroom
+            $kept    = if ($headroom -gt 0) { @(@($candidates)[0..($headroom - 1)]) } else { @() }
+            $candidates = New-Object System.Collections.Generic.List[object]
+            foreach ($k in $kept) { $candidates.Add($k) }
+
+            Write-Log ("Tracked ceiling reached: {0} suppressed against a ceiling of {1}. Refusing maintenance mode for {2} machine(s) this pass; their alerts are left open." -f
+                       $tracked.Count, $TrackedCeiling, $refused) 'ERROR'
+
+            Send-Notification -Key 'SuppressionRefused' -Severity 'ERROR' `
+                -Subject "Suppression refused for $refused machine(s) - ceiling $TrackedCeiling reached" `
+                -Body (@(
+                    "$($tracked.Count) machines are suppressed, at or above the ceiling of $TrackedCeiling."
+                    ""
+                    "$refused machine(s) that would otherwise have entered maintenance mode this pass"
+                    "were refused. Their alerts remain open and will be seen again next pass."
+                    ""
+                    "The ceiling is deliberately absolute: suppressing past it would blind the"
+                    "monitoring for up to $MaintenanceHours hours with nothing in the log to show it."
+                    ""
+                    "Either a spurious source of Event 1074 alerts is running, or a genuine outage"
+                    "larger than the ceiling is in progress. Check $StateFile and the '$AlertName' rule."
+                ) -join "`r`n") -MinIntervalMinutes 60
+        }
+    }
+
+    $mmFailed = 0
+    if ($candidates.Count -gt 0) {
+        Invoke-MaintenanceMode -Instances @($candidates.Instance) -EndUtc $endUtc `
+            -Comment "$Marker - orderly shutdown detected (Event 1074)"
+
+        # Verify before tracking or closing. Recording a machine as suppressed
+        # when MM did not take, and closing its alert, buries it for the whole
+        # window - it looks handled and alerts the entire time.
+        # ForEach-Object, not $candidates.Instance.Id.ToString(). PowerShell
+        # enumerates PROPERTY access over a collection but not METHOD calls, so
+        # that form ran ToString() on the Object[] itself and passed the literal
+        # string "System.Object[]" - no GUID parsed, empty map, and every
+        # machine on the pass was reported as an MM failure on a pass where MM
+        # had actually applied cleanly.
+        $check = Get-VerifiedInstanceMap -ExpectInMaintenanceMode $true `
+                     -Ids @($candidates | ForEach-Object { $_.Instance.Id.ToString() })
+        foreach ($e in $candidates) {
+            $fresh = $check[$e.Instance.Id.ToString()]
+            if ($fresh -and $fresh.InMaintenanceMode) {
+                $e.Owner  = 'Ours'                    # we just set this one
+                $e.EndUtc = $endUtc.ToString('o')
+                $applied.Add($e)
+            } else {
+                # Leave the alert open at ResolutionState 0 so the next pass retries.
+                Write-Log "MM did not take for $($e.Fqdn) - alert left open for retry." 'ERROR'
+                Add-EventRecord -Type 'MmFailed' -Fqdn $e.Fqdn -Detail 'apply'
+                $mmFailed++
+            }
+        }
+        $script:Stats.MmFailures += $mmFailed
+        Test-MmFailureRate -Failed $mmFailed -Attempted $candidates.Count -Phase 'apply'
+    }
+
+    $nowStamp = [datetime]::UtcNow.ToString('o')
+    foreach ($e in $applied) {
+        $tracked.Add([pscustomobject]@{
+            Fqdn            = $e.Fqdn
+            InstanceId      = $e.Instance.Id.ToString()
+            AppliedUtc      = $nowStamp
+            EndUtc          = $e.EndUtc          # the window that IS there, not one we assumed
+            PingStreak      = 0
+            PingOnlyStreak  = 0
+            LastReportedUtc = ''
+            LastDnsOkUtc    = ''      # unknown until the first sweep probes it
+            ForeignSinceUtc = $(if ($e.Owner -eq 'Foreign') { $nowStamp } else { '' })
+        }) | Out-Null
+        $processed.Add($e.Alert)
+
+        if ($e.Owner -eq 'Foreign') {
+            # Tracked so the reapply path picks it up if that window lapses while
+            # the machine is still down, but never extended and never released -
+            # the same contract the sweep already honours.
+            Write-Log ("{0} was already in a maintenance window this script did not set - tracked, but left alone." -f $e.Fqdn) 'WARN'
+            Add-EventRecord -Type 'ForeignMm' -Fqdn $e.Fqdn -Detail 'already in MM when the alert arrived'
+        }
+        Add-EventRecord -Type 'Applied' -Fqdn $e.Fqdn
+    }
+
+    if ($applied.Count -gt 0) {
+        Set-TrackedState -Rows $tracked
+        $script:Stats.Applied += $applied.Count
+        Write-Log "Maintenance mode confirmed for $($applied.Count) machine(s) until $endUtc UTC."
+    }
+
+    if ($processed.Count -gt 0) {
+        # Closing the alert is verified the same way a maintenance-mode write is,
+        # and for the same reason: "the SDK call did not throw" is not proof.
+        #
+        # The failure used to be logged 'WARN'. Write-Log only counts 'ERROR'
+        # toward $script:Errs, so a pass on which EVERY closure failed still
+        # ended on the clean Information event, the Missing Event monitor stayed
+        # satisfied, and the watchdog reported a healthy run while handled
+        # shutdown alerts accumulated unclosed in the console. That is the one
+        # failure shape this script is built to avoid, so it is an ERROR now.
+        #
+        # It is not fatal to the machine: a failed closure leaves the alert at
+        # ResolutionState 0, the next pass re-queries it, finds the FQDN already
+        # tracked and closes it on the closeOnly path. The ERROR exists to make
+        # a PERSISTENT failure visible rather than silent.
+        $alertIds  = [guid[]]@($processed | ForEach-Object { $_.Id })
+        $setFailed = $false
+        try {
+            Set-SCOMAlert -Alert $processed.ToArray() -ResolutionState $ProcessedResolutionState `
+                -Comment "$Marker - processed"
+        } catch {
+            $setFailed = $true
+            Write-Log "Could not update resolution state for $($processed.Count) alert(s): $($_.Exception.Message)" 'ERROR'
+        }
+
+        if (-not $setFailed) {
+            try {
+                $unclosed = @(Get-SCOMAlert -Id $alertIds -ErrorAction Stop |
+                              Where-Object { $_.ResolutionState -ne $ProcessedResolutionState })
+
+                # Same settle problem as Get-VerifiedInstanceMap: a read on the
+                # same tick as the write can still show the old state, and
+                # calling that a failure puts an ERROR on a pass where nothing
+                # was wrong. Pay the wait only for the stragglers - the normal
+                # case costs one read and no sleep. This is inside the mutex.
+                if ($unclosed.Count -gt 0 -and $VerifySettleMs -gt 0) {
+                    Write-Verbose "$($unclosed.Count) alert(s) had not settled; re-reading after $VerifySettleMs ms."
+                    Start-Sleep -Milliseconds $VerifySettleMs
+                    $unclosed = @(Get-SCOMAlert -Id ([guid[]]@($unclosed | ForEach-Object { $_.Id })) -ErrorAction Stop |
+                                  Where-Object { $_.ResolutionState -ne $ProcessedResolutionState })
+                }
+
+                if ($unclosed.Count -gt 0) {
+                    Write-Log ("{0} of {1} alert(s) did not take resolution state {2}. They stay open; the next pass sees them again and closes them on the duplicate path." -f
+                               $unclosed.Count, $alertIds.Count, $ProcessedResolutionState) 'ERROR'
+                    foreach ($u in ($unclosed | Select-Object -First 10)) {
+                        Add-EventRecord -Type 'AlertCloseFailed' -Fqdn ([string]$u.PrincipalName) -Detail ([string]$u.Id)
+                    }
+                } else {
+                    Write-Verbose "Resolution state $ProcessedResolutionState confirmed for $($alertIds.Count) alert(s)."
+                }
+            } catch {
+                # Could not READ them back. Says nothing about whether the write
+                # took, so it is not an error on its own.
+                Write-Log "Could not verify alert resolution states: $($_.Exception.Message)" 'WARN'
+            }
+        }
+    }
+
+    $script:Stats.Tracked = $tracked.Count
+    Update-TrackedCount -Count $tracked.Count
+    Test-SuppressionCeiling -TrackedCount $tracked.Count -AppliedThisPass $applied.Count
+}
+
+# ==========================================================================
+# DIGEST - weekly report, and event-history pruning
+# ==========================================================================
+function Invoke-DigestPass {
+    $nowUtc  = [datetime]::UtcNow
+    $tracked = @(Get-TrackedState)      # @(): a lone row has no .Count on 5.1
+    $events  = Get-EventRecords -Days 7
+
+    $applied         = @($events | Where-Object { $_.Type -eq 'Applied' })
+    $released        = @($events | Where-Object { $_.Type -eq 'Released' -or $_.Type -eq 'PingOnlyRelease' })
+    $pingOnlyRel     = @($events | Where-Object { $_.Type -eq 'PingOnlyRelease' })
+    $vanished        = @($events | Where-Object { $_.Type -eq 'InstanceVanished' })
+    $orphans         = @($events | Where-Object { $_.Type -eq 'OrphanAlert' })
+    $mmFailed        = @($events | Where-Object { $_.Type -eq 'MmFailed' })
+    $reapplied       = @($events | Where-Object { $_.Type -eq 'Reapplied' })
+    $excludedEv      = @($events | Where-Object { $_.Type -like 'Excluded*' })
+
+    # Outage durations, from the Released records.
+    $durations = @()
+    foreach ($r in $released) {
+        $d = 0.0
+        if ([double]::TryParse([string]$r.Detail, [ref]$d) -and $d -gt 0) { $durations += $d }
+    }
+    $avgDays  = if ($durations.Count -gt 0) { [math]::Round(($durations | Measure-Object -Average).Average, 2) } else { 0 }
+    $maxDays  = if ($durations.Count -gt 0) { [math]::Round(($durations | Measure-Object -Maximum).Maximum, 2) } else { 0 }
+    $medDays  = 0
+    if ($durations.Count -gt 0) {
+        $sorted  = @($durations | Sort-Object)
+        # Even counts take the mean of the two middle values; the old code took
+        # the upper-middle one, which is not a median.
+        $medDays = if ($sorted.Count % 2 -eq 0) {
+            [math]::Round((($sorted[($sorted.Count / 2) - 1] + $sorted[$sorted.Count / 2]) / 2), 2)
+        } else {
+            [math]::Round($sorted[[int][math]::Floor($sorted.Count / 2)], 2)
+        }
+    }
+
+    # Long returns - machines that came back after being dormant a long time.
+    $longReturns = @($released | Where-Object {
+        $d = 0.0
+        [double]::TryParse([string]$_.Detail, [ref]$d) -and $d -ge $ReviewAfterDays
+    } | Sort-Object { [double]$_.Detail } -Descending)
+
+    # Currently dormant.
+    $dormant = New-Object System.Collections.Generic.List[object]
+    foreach ($row in $tracked) {
+        $a = ConvertTo-Utc $row.AppliedUtc
+        if ($a -and ($nowUtc - $a).TotalDays -ge $ReviewAfterDays) {
+            $lastDns   = ConvertTo-Utc $row.LastDnsOkUtc
+            $daysNoDns = $(if ($lastDns) { [math]::Round(($nowUtc - $lastDns).TotalDays, 1) } else { $null })
+            $dormant.Add([pscustomobject]@{
+                Fqdn      = $row.Fqdn
+                DownSince = $(if ($a) { $a.ToString('yyyy-MM-dd') } else { '' })
+                DaysDown  = [math]::Round(($nowUtc - $a).TotalDays, 1)
+                DaysNoDns = $(if ($null -eq $daysNoDns) { 'never resolved' } else { $daysNoDns })
+                DnsGone   = (($null -eq $daysNoDns) -or ($daysNoDns -ge $ReviewAfterDays))
+            })
+        }
+    }
+    $dormantSorted = @($dormant | Sort-Object DaysDown -Descending)
+
+    # Attach the dormant list as a CSV.
+    $attachment = @()
+    if ($dormantSorted.Count -gt 0) {
+        try {
+            $csv = Join-Path $env:TEMP ("ScomDormantAgents_{0}.csv" -f $nowUtc.ToString('yyyyMMdd'))
+            $dormantSorted | Export-Csv -Path $csv -NoTypeInformation -Force
+            $attachment = @($csv)
+        } catch {
+            Write-Log "Could not build the dormant CSV attachment: $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("SCOM shutdown suppression - week ending $($nowUtc.ToString('yyyy-MM-dd')) UTC")
+    $lines.Add('')
+    $lines.Add('SUPPRESSION')
+    $lines.Add(("  Currently suppressed      : {0}" -f $tracked.Count))
+    $lines.Add(("  Entered maintenance mode  : {0}" -f $applied.Count))
+    $lines.Add(("  Released                  : {0}" -f $released.Count))
+    $lines.Add(("  Lapsed windows reapplied  : {0}" -f $reapplied.Count))
+    $lines.Add('')
+    $lines.Add('OUTAGE LENGTH (released this week, days)')
+    $lines.Add(("  Average {0}   Median {1}   Longest {2}" -f $avgDays, $medDays, $maxDays))
+    $lines.Add('')
+
+    if ($dormantSorted.Count -gt 0) {
+        $lines.Add("DORMANT $ReviewAfterDays+ DAYS - candidates for decommissioning ($($dormantSorted.Count))")
+        foreach ($d in ($dormantSorted | Select-Object -First 40)) {
+            $lines.Add(("  {0,-45} {1,6} days   since {2}{3}" -f $d.Fqdn, $d.DaysDown, $d.DownSince,
+                        $(if ($d.DnsGone) { '   [no DNS record]' } else { '' })))
+        }
+        if ($dormantSorted.Count -gt 40) {
+            $lines.Add("  ... and $($dormantSorted.Count - 40) more; full list attached.")
+        }
+        $lines.Add('')
+
+        $dnsGone = @($dormantSorted | Where-Object { $_.DnsGone })
+        if ($dnsGone.Count -gt 0) {
+            $lines.Add("OF THOSE, NO DNS RECORD FOR $ReviewAfterDays+ DAYS ($($dnsGone.Count))")
+            $lines.Add("  Dormant AND unresolvable. A machine that is merely switched off")
+            $lines.Add("  usually keeps its DNS record; a decommissioned one usually loses it.")
+            $lines.Add("  Treat that as the strongest evidence in this report, not as proof:")
+            $lines.Add("  scavenging, a DNS change and a record pulled ahead of a rebuild all")
+            $lines.Add("  look identical from here. Confirm before removing a SCOM object.")
+            foreach ($d in ($dnsGone | Select-Object -First 40)) {
+                $lines.Add(("  {0,-45} {1,6} days down" -f $d.Fqdn, $d.DaysDown))
+            }
+            $lines.Add('')
+        }
+    }
+
+    $foreignRows = @($tracked | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.ForeignSinceUtc) })
+    if ($foreignRows.Count -gt 0) {
+        $lines.Add("IN A MAINTENANCE WINDOW THIS SCRIPT DID NOT SET ($($foreignRows.Count))")
+        $lines.Add("  Someone - an administrator, or another automation - owns the window")
+        $lines.Add("  on these. They are not being extended or released, so nothing here")
+        $lines.Add("  fights whoever set them. Management resumes automatically if that")
+        $lines.Add("  window lapses while the machine is still down.")
+        foreach ($r in ($foreignRows | Select-Object -First 20)) {
+            $since = ConvertTo-Utc $r.ForeignSinceUtc
+            $lines.Add(("  {0,-45} since {1}" -f $r.Fqdn, $(if ($since) { $since.ToString('yyyy-MM-dd HH:mm') } else { 'unknown' })))
+        }
+        if ($foreignRows.Count -gt 20) { $lines.Add("  ... and $($foreignRows.Count - 20) more.") }
+        $lines.Add('')
+    }
+
+    if ($longReturns.Count -gt 0) {
+        $lines.Add("RETURNED AFTER $ReviewAfterDays+ DAYS ($($longReturns.Count))")
+        foreach ($r in ($longReturns | Select-Object -First 20)) {
+            $lines.Add(("  {0,-45} was down {1} days" -f $r.Fqdn, $r.Detail))
+        }
+        $lines.Add('')
+    }
+
+    if ($pingOnlyRel.Count -gt 0) {
+        $lines.Add("RELEASED WITH THE AGENT STILL SILENT ($($pingOnlyRel.Count))")
+        $lines.Add("  These answered ping but never opened TCP $AgentPort. Each is a")
+        $lines.Add("  live machine whose agent is not running - worth investigating.")
+        foreach ($r in ($pingOnlyRel | Select-Object -First 20)) { $lines.Add("  $($r.Fqdn)") }
+        $lines.Add('')
+    }
+
+    if ($vanished.Count -gt 0) {
+        $lines.Add("DELETED FROM SCOM WHILE SUPPRESSED ($($vanished.Count))")
+        $lines.Add("  Normal if they were decommissioned properly. Worth a look if not.")
+        foreach ($v in ($vanished | Select-Object -First 20)) { $lines.Add("  $($v.Fqdn)") }
+        $lines.Add('')
+    }
+
+    if ($orphans.Count -gt 0) {
+        $uniqueOrphans = @($orphans | Select-Object -ExpandProperty Fqdn -Unique)
+        $lines.Add("SHUTDOWN ALERTS WITH NO WINDOWS COMPUTER OBJECT ($($uniqueOrphans.Count) machines)")
+        $lines.Add("  These raised a shutdown alert but could not be resolved to an")
+        $lines.Add("  object, so they were NOT suppressed. Usually an agent removed")
+        $lines.Add("  from SCOM but still reporting, or a name-format mismatch.")
+        foreach ($o in ($uniqueOrphans | Select-Object -First 20)) { $lines.Add("  $o") }
+        $lines.Add('')
+    }
+
+    if ($excludedEv.Count -gt 0) {
+        $uniqueExcluded = @($excludedEv | Select-Object -ExpandProperty Fqdn -Unique)
+        $lines.Add("EXCLUDED MACHINES ($($uniqueExcluded.Count))")
+        $lines.Add("  On the exclusion list, so never put into maintenance mode. Either")
+        $lines.Add("  they shut down (alert left open), or they were added to the list")
+        $lines.Add("  while suppressed and have been taken out of it.")
+        foreach ($o in ($uniqueExcluded | Select-Object -First 20)) { $lines.Add("  $o") }
+        $lines.Add('')
+    }
+
+    if ($mmFailed.Count -gt 0) {
+        $lines.Add("MAINTENANCE MODE FAILURES ($($mmFailed.Count) occurrences)")
+        $lines.Add("  See $LogPath for detail.")
+        $lines.Add('')
+    }
+
+    $body = $lines -join "`r`n"
+    Write-Output $body
+
+    $to = if ($MailReportTo.Count -gt 0) { $MailReportTo } else { $MailTo }
+    Send-Notification -Key 'WeeklyDigest' -Severity 'INFO' `
+        -Subject ("Weekly suppression digest - {0} suppressed, {1} dormant {2}+ days" -f
+                  $tracked.Count, $dormantSorted.Count, $ReviewAfterDays) `
+        -Body $body -MinIntervalMinutes 360 -To $to -Attachment $attachment
+
+    foreach ($a in $attachment) { try { Remove-Item $a -Force -ErrorAction SilentlyContinue } catch { } }
+
+    # --- Prune the event history ------------------------------------------
+    if ($DryRun) { Write-Log 'DRYRUN: event history and dormant report not pruned.' }
+    if ((Test-Path $EventCsvPath) -and -not $DryRun) {
+        try {
+            $cutoff = $nowUtc.AddDays(-$EventRetentionDays)
+            $all    = @(Import-Csv -Path $EventCsvPath -ErrorAction Stop)
+            $kept   = @($all | Where-Object {
+                $t = ConvertTo-Utc $_.Utc
+                $t -and $t -ge $cutoff
+            })
+            if ($kept.Count -lt $all.Count) {
+                $tmp = "$EventCsvPath.tmp"
+                if ($kept.Count -gt 0) {
+                    $kept | Export-Csv -Path $tmp -NoTypeInformation -Force
+                } else {
+                    Set-Content -Path $tmp -Value 'Utc,Type,Fqdn,Detail' -Force
+                }
+                Move-Item -Path $tmp -Destination $EventCsvPath -Force
+                Write-Log "Pruned $($all.Count - $kept.Count) event record(s) older than $EventRetentionDays days."
+            }
+        } catch {
+            Write-Log "Event history prune failed: $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    # --- Prune the dormant report -----------------------------------------
+    # The sweep appends to this on every report cycle and nothing ever trimmed
+    # it, so it grew without bound and accumulated a duplicate row per machine
+    # per ReportEveryDays. Rows written before ReportedUtc existed carry no
+    # timestamp and go on the first prune; the digest above says the same thing.
+    if ((Test-Path $ReportPath) -and -not $DryRun) {
+        try {
+            $cutoff = $nowUtc.AddDays(-$EventRetentionDays)
+            $all    = @(Import-Csv -Path $ReportPath -ErrorAction Stop)
+            $kept   = @($all | Where-Object {
+                $t = ConvertTo-Utc $_.ReportedUtc
+                $t -and $t -ge $cutoff
+            })
+            if ($kept.Count -lt $all.Count) {
+                $tmp = "$ReportPath.tmp"
+                if ($kept.Count -gt 0) {
+                    $kept | Export-Csv -Path $tmp -NoTypeInformation -Force
+                } else {
+                    Set-Content -Path $tmp -Value 'ReportedUtc,Fqdn,DownSince,DaysDown,DaysNoDns' -Force
+                }
+                Move-Item -Path $tmp -Destination $ReportPath -Force
+                Write-Log "Pruned $($all.Count - $kept.Count) dormant-report row(s) older than $EventRetentionDays days."
+            }
+        } catch {
+            Write-Log "Dormant report prune failed: $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    $script:Stats.Tracked = $tracked.Count
+}
+
+# ==========================================================================
+# Entry point
+# ==========================================================================
+try {
+    Import-Module OperationsManager -ErrorAction Stop
+} catch {
+    Write-Log "Could not load the OperationsManager module: $($_.Exception.Message)" 'ERROR'
+    Write-AppEvent -EventId ((Get-EventBase) + 2) -EntryType 'Error' -Message "$(Get-RunMode): OperationsManager module failed to load: $($_.Exception.Message)"
+    exit 1
+}
+
+# ==========================================================================
+# CHANGE mode - scheduled change windows from the CMDB
+# ==========================================================================
+# Deliberately kept at arm's length from the shutdown side:
+#   - its own state file, so tracked-state counting, TrackedCeiling and the
+#     state-loss logic are untouched by it
+#   - its own mutex, so a slow SQL query can never starve the APPLY loop
+#   - it creates SCOM maintenance SCHEDULES, not maintenance mode: SCOM starts
+#     them at DOWN_START and ends them at PLANNED_END with no help from us
+#   - the windows it creates read as FOREIGN to Get-MaintenanceOwner, so the
+#     sweep never extends or releases somebody's change window
+#
+# Windows are never extended. If a change overruns it is failed and re-raised,
+# so a schedule that has already started is left exactly as it is.
+
+$script:ChangeMap = $null
+
+$ChangeQuery = @'
+SELECT TOP (@MaxRows)
+    c.NUMBER,
+    c.BRIEF_DESCRIPTION,
+    c.DOWN_START,
+    c.PLANNED_END,
+    (
+        SELECT d.CI_NAME + ' ' AS 'data()'
+        FROM DEVICE2M1 d
+        WHERE d.CI_NAME LIKE @CiFilter
+          AND CHARINDEX(d.LOGICAL_NAME, c.ASSETS, 1) <> 0
+        FOR XML PATH('')
+    ) AS CONFIG_ITEMS
+FROM [dbo].[DOD_V_CHM_OVERVIEW] c
+WHERE c.STATUS          <> 'closed'
+  AND c.APPROVAL_STATUS  = 'approved'
+  AND c.CI_DOWN          = 't'
+  AND c.DOWN_START  IS NOT NULL
+  AND c.PLANNED_END IS NOT NULL
+  AND c.PLANNED_END > GETDATE()
+  AND c.DOWN_START  < DATEADD(day, @LookAhead, GETDATE())
+ORDER BY c.DOWN_START;
+'@
+
+function Get-ChangeWindowRows {
+    if ([string]::IsNullOrWhiteSpace($ChangeStateFile)) { return @() }
+
+    # ---- Recovery, mirroring Get-TrackedState -----------------------------
+    # Set-ChangeWindowRows leaves the previous generation at .bak on every
+    # successful write, and nothing read it back until now.
+    #
+    # Losing this file does not fail safe on its own. It is what tells the
+    # shutdown side that a window is change-driven and hands-off; without it,
+    # ownership falls back to the comment test, and CHANGE comments are written
+    # WITHOUT $Marker precisely so they read as foreign. But that fallback only
+    # works on an SDK build that surfaces window comments at all. Where it does
+    # not, Get-MaintenanceOwner returns 'Unknown', every caller treats Unknown
+    # as ours, and the sweep extends and releases somebody's change window.
+    # Two independent failures are needed for that. One of them is cheap to
+    # remove, so it is removed.
+    #
+    # The primary is not restored from the backup here - unlike the shutdown
+    # state, the next CHANGE pass rewrites this file in full anyway.
+    $rows = $null
+    if (Test-Path $ChangeStateFile) {
+        try { $rows = @(Import-Csv -Path $ChangeStateFile -ErrorAction Stop) }
+        catch {
+            Write-Log "Change window state at $ChangeStateFile could not be read: $($_.Exception.Message)" 'ERROR'
+            $rows = $null
+        }
+    }
+
+    if ($null -eq $rows) {
+        $bak = "$ChangeStateFile.bak"
+        if (Test-Path $bak) {
+            try {
+                $bakRows = @(Import-Csv -Path $bak -ErrorAction Stop)
+                if ($bakRows.Count -gt 0) {
+                    $rows = $bakRows
+                    Write-Log "Change window state missing or unreadable - recovered $($bakRows.Count) row(s) from $bak." 'ERROR'
+                    Add-EventRecord -Type 'ChangeStateRecovered' -Fqdn '' -Detail $bakRows.Count
+                } else {
+                    # An empty backup recovers nothing. Do not dress that up.
+                    Write-Log "Backup change window state at $bak is empty; nothing to recover." 'WARN'
+                }
+            } catch {
+                Write-Log "Backup change window state at $bak is also unreadable: $($_.Exception.Message)" 'ERROR'
+            }
+        }
+    }
+
+    # No file and no backup is the normal state before CHANGE has ever run.
+    if ($null -eq $rows) { return @() }
+
+    try {
+        # Projected to a fixed shape, so an older file missing a column reads
+        # back with that column empty instead of throwing when it is assigned.
+        $out = New-Object System.Collections.Generic.List[object]
+        foreach ($r in $rows) {
+            if ([string]::IsNullOrWhiteSpace($r.InstanceId) -or [string]::IsNullOrWhiteSpace($r.EndUtc)) { continue }
+            $props = $r.PSObject.Properties
+            $out.Add([pscustomobject]@{
+                ChangeNumber    = [string]$r.ChangeNumber
+                ScheduleName    = [string]$r.ScheduleName
+                Fqdn            = [string]$r.Fqdn
+                InstanceId      = [string]$r.InstanceId
+                StartUtc        = [string]$r.StartUtc
+                EndUtc          = [string]$r.EndUtc
+                WrittenUtc      = $(if ($props['WrittenUtc'])      { [string]$r.WrittenUtc }      else { '' })
+                MissingSinceUtc = $(if ($props['MissingSinceUtc']) { [string]$r.MissingSinceUtc } else { '' })
+            })
+        }
+        return $out.ToArray()
+    } catch {
+        # Never fatal for the shutdown side. A change file that cannot be
+        # projected must not stop a sweep; it only means ownership falls back
+        # to the comment test.
+        Write-Log "Change window state could not be projected into rows: $($_.Exception.Message)" 'ERROR'
+        return @()
+    }
+}
+
+function Set-ChangeWindowRows {
+    param($Rows)
+    if ($DryRun) { Write-Verbose 'DRYRUN: change window state not written.'; return }
+    New-ParentDirectory -Path $ChangeStateFile
+    $header = 'ChangeNumber,ScheduleName,Fqdn,InstanceId,StartUtc,EndUtc,WrittenUtc,MissingSinceUtc'
+    $tmp    = "$ChangeStateFile.tmp"
+    $arr    = @($Rows)
+    if ($arr.Count -gt 0) {
+        $arr | Select-Object ChangeNumber, ScheduleName, Fqdn, InstanceId, StartUtc, EndUtc, WrittenUtc, MissingSinceUtc |
+            Export-Csv -Path $tmp -NoTypeInformation -Force
+    } else {
+        Set-Content -Path $tmp -Value $header -Force
+    }
+    if (Test-Path $ChangeStateFile) {
+        try { [System.IO.File]::Replace($tmp, $ChangeStateFile, "$ChangeStateFile.bak", $true) }
+        catch {
+            # Same fallback as Set-TrackedState: keep the backup generation.
+            Write-Log "Change state swap failed ($($_.Exception.Message)); falling back to copy-then-move." 'WARN'
+            try { Copy-Item -Path $ChangeStateFile -Destination "$ChangeStateFile.bak" -Force -ErrorAction Stop }
+            catch { Write-Log "Could not refresh ${ChangeStateFile}.bak: $($_.Exception.Message)" 'WARN' }
+            Move-Item -Path $tmp -Destination $ChangeStateFile -Force
+        }
+    } else {
+        Move-Item -Path $tmp -Destination $ChangeStateFile -Force
+    }
+}
+
+# InstanceId -> end of the change window the machine is inside RIGHT NOW.
+# Built once per invocation. Small by construction: it only ever holds machines
+# named by open changes, never the estate.
+function Get-ChangeMap {
+    if ($null -ne $script:ChangeMap) { return $script:ChangeMap }
+    $map = @{}
+    $now = [datetime]::UtcNow
+    foreach ($r in (Get-ChangeWindowRows)) {
+        $start = ConvertTo-Utc $r.StartUtc
+        $end   = ConvertTo-Utc $r.EndUtc
+        if ($null -eq $end) { continue }
+        if ($end.AddMinutes($ChangeWindowGraceMinutes) -lt $now) { continue }                        # finished
+        if ($null -ne $start -and $start.AddMinutes(-$ChangeWindowGraceMinutes) -gt $now) { continue } # not started
+        $k = [string]$r.InstanceId
+        if (-not $map.ContainsKey($k) -or $map[$k] -lt $end) { $map[$k] = $end }
+    }
+    $script:ChangeMap = $map
+    if ($map.Count -gt 0) { Write-Log "$($map.Count) machine(s) are inside a scheduled change window and are hands-off." }
+    return $script:ChangeMap
+}
+
+function Test-ChangeWindow {
+    param($InstanceId)
+    if (-not $InstanceId) { return $false }
+    return (Get-ChangeMap).ContainsKey([string]$InstanceId)
+}
+
+# Schedule names have to be unique per change, and stripping unsafe characters
+# alone can collide: 'CHM-123/45' and 'CHM-12345' both reduce to CHM-12345, and
+# the second change would silently amend the first one's window. Anything that
+# had to be altered therefore carries a short deterministic hash of the
+# ORIGINAL number. Untouched numbers - the normal case - keep their plain name.
+function New-ChangeScheduleName {
+    param([Parameter(Mandatory)][string]$Number)
+    $safe = (($Number -replace '[^A-Za-z0-9\-_]', '-') -replace '-{2,}', '-').Trim('-')
+    if ($safe -cne $Number) {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Number)) }
+        finally { $sha.Dispose() }
+        $safe = '{0}-{1}{2}' -f $safe, $bytes[0].ToString('x2'), $bytes[1].ToString('x2')
+    }
+    return $ChangeSchedulePrefix + $safe
+}
+
+# --------------------------------------------------------------------------
+function Invoke-ChangePass {
+    $created = 0; $amended = 0; $removed = 0; $unchanged = 0
+
+    # First, so an unreadable exclusion file stops the pass before anything moves.
+    $exclusions = @(Get-ExclusionList)
+
+    # ---- read the approved changes ----------------------------------------
+    $table = $null
+    $connection = $null
+    try {
+        $connection = New-Object System.Data.SqlClient.SqlConnection
+        $connection.ConnectionString = "Server=$ChangeSqlServer;Database=$ChangeDatabase;Integrated Security=True;Connect Timeout=15;Application Name=ScomChangeMM"
+        $connection.Open()
+        $cmd = $connection.CreateCommand()
+        $cmd.CommandText    = $ChangeQuery
+        $cmd.CommandTimeout = 60
+        [void]$cmd.Parameters.AddWithValue('@MaxRows',   $ChangeMaxRows)
+        [void]$cmd.Parameters.AddWithValue('@CiFilter',  "%$ChangeCiFilter%")
+        [void]$cmd.Parameters.AddWithValue('@LookAhead', $ChangeLookAheadDays)
+        $reader = $cmd.ExecuteReader()
+        $table  = New-Object System.Data.DataTable
+        try { $table.Load($reader) } finally { $reader.Dispose() }
+    } catch {
+        $msg = "Change query against [$ChangeSqlServer].[$ChangeDatabase] failed: $($_.Exception.Message)"
+        Write-Log $msg 'ERROR'
+        Send-Notification -Key 'ChangeQueryFailure' -Severity 'ERROR' `
+            -Subject 'Change maintenance windows are not being scheduled' `
+            -Body ($msg + "`r`n`r`nApproved changes will not have maintenance windows created while this persists.") `
+            -MinIntervalMinutes 120
+        return
+    } finally {
+        if ($null -ne $connection) { $connection.Dispose() }
+    }
+
+    $changes = New-Object System.Collections.Generic.List[object]
+    foreach ($row in $table.Rows) {
+        $cis = ''
+        if (-not [System.DBNull]::Value.Equals($row['CONFIG_ITEMS'])) { $cis = [string]$row['CONFIG_ITEMS'] }
+        if ([string]::IsNullOrWhiteSpace($cis)) { continue }        # no CIs matched the filter
+        $changes.Add([pscustomobject]@{
+            Number      = ([string]$row['NUMBER']).Trim()
+            Description = [string]$row['BRIEF_DESCRIPTION']
+            DownStart   = [datetime]$row['DOWN_START']
+            PlannedEnd  = [datetime]$row['PLANNED_END']
+            Cis         = @($cis -split '\s+' | Where-Object { $_ } | Select-Object -Unique)
+        })
+    }
+    Write-Log "Change query returned $($table.Rows.Count) row(s); $($changes.Count) carry CIs."
+
+    # ---- what SCOM already has --------------------------------------------
+    # Also the rights check: reading schedules needs the same admin role that
+    # creating them does, so a permissions problem surfaces here, once, plainly.
+    $existing = @{}
+    try {
+        foreach ($sch in @(Get-SCOMMaintenanceSchedule -ErrorAction Stop)) {
+            if ($sch.ScheduleName) { $existing[[string]$sch.ScheduleName] = $sch }
+        }
+    } catch {
+        $msg = "Cannot read SCOM maintenance schedules: $($_.Exception.Message)"
+        Write-Log ($msg + ' The account running this needs the Operations Manager Administrator role.') 'ERROR'
+        Send-Notification -Key 'ChangeScheduleAccess' -Severity 'ERROR' `
+            -Subject 'Change maintenance windows cannot be scheduled' `
+            -Body ($msg + "`r`n`r`nMaintenance schedules require the Operations Manager Administrator role. Approved changes are not being suppressed.") `
+            -MinIntervalMinutes 720
+        return
+    }
+
+    # ---- resolve every CI in one batched lookup ---------------------------
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($c in $changes) {
+        foreach ($ci in $c.Cis) {
+            [void]$names.Add($ci)
+            if ($ChangeDomainSuffix -and $ci -notlike '*.*') { [void]$names.Add("$ci.$ChangeDomainSuffix") }
+        }
+    }
+    $cmap = @{}
+    if ($names.Count -gt 0) { $cmap = Get-WindowsComputerMap -Fqdns $names.ToArray() }
+
+    # ---- carry forward windows that are still live ------------------------
+    # A change that closes after its window has started stops coming back from
+    # the query, but SCOM is still running the window. Dropping the row here
+    # would hand the machine back to the shutdown side mid-outage.
+    $nowUtc = [datetime]::UtcNow
+    $keep   = @{}
+    foreach ($r in (Get-ChangeWindowRows)) {
+        $end = ConvertTo-Utc $r.EndUtc
+        if ($null -eq $end -or $end.AddMinutes($ChangeWindowGraceMinutes) -lt $nowUtc) { continue }
+        $keep["$($r.ChangeNumber)|$($r.InstanceId)"] = $r
+    }
+
+    $seen = New-Object System.Collections.Generic.HashSet[string]
+
+    foreach ($chg in $changes) {
+        $name = New-ChangeScheduleName -Number $chg.Number
+        [void]$seen.Add($name)
+
+        $instances = New-Object System.Collections.Generic.List[object]
+        $excludedHere = 0
+        foreach ($ci in $chg.Cis) {
+            $inst = $cmap[$ci]
+            if (-not $inst -and $ChangeDomainSuffix -and $ci -notlike '*.*') { $inst = $cmap["$ci.$ChangeDomainSuffix"] }
+            if (-not $inst) { Write-Log "$($chg.Number): CI not found in SCOM -> $ci" 'WARN'; continue }
+
+            $hit = Get-ExclusionMatch -Fqdn $inst.DisplayName -Exclusions $exclusions
+            if ($hit) {
+                Write-Log "$($chg.Number): $($inst.DisplayName) is on the exclusion list ('$hit') - left out of the change window." 'WARN'
+                $excludedHere++
+                continue
+            }
+            $instances.Add($inst)
+        }
+        if ($instances.Count -eq 0) {
+            Write-Log "$($chg.Number): no CIs resolved$(if ($excludedHere) { ' (or all excluded)' }); no window scheduled." 'WARN'
+            continue
+        }
+
+        # The CI set is part of what "unchanged" means. Comparing start and
+        # duration alone left a window covering the OLD set whenever a change
+        # gained or lost a CI - or a CI was added to the exclusion list. The
+        # last pass's state rows are the record of what the window was given.
+        $curIds  = @($instances | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
+        $prevIds = @($keep.Values | Where-Object { $_.ChangeNumber -eq $chg.Number } |
+                     ForEach-Object { [string]$_.InstanceId } | Sort-Object -Unique)
+        $sameCis = ($prevIds.Count -eq 0) -or (-not (Compare-Object -ReferenceObject $prevIds -DifferenceObject $curIds))
+
+        # A schedule cannot start in the past. An outage already under way starts
+        # now and still ends at PLANNED_END.
+        $start = if ($chg.DownStart -gt (Get-Date)) { $chg.DownStart } else { (Get-Date).AddMinutes(2) }
+        $mins  = [int][Math]::Ceiling(($chg.PlannedEnd - $start).TotalMinutes)
+        if ($mins -lt $ChangeMinDurationMinutes) { $mins = $ChangeMinDurationMinutes }
+        if ($mins -gt ($ChangeMaxDurationHours * 60)) {
+            Write-Log "$($chg.Number): window of $mins min exceeds the $ChangeMaxDurationHours h cap; capped." 'WARN'
+            $mins = $ChangeMaxDurationHours * 60
+        }
+
+        # Deliberately WITHOUT $Marker. The change state file is what makes these
+        # windows hands-off; if it is ever lost, the comment test is the fallback
+        # and it must read foreign, not ours.
+        $comment = "$($chg.Number) - $($chg.Description)" -replace '[\r\n]+', ' '
+        if ($comment.Length -gt 250) { $comment = $comment.Substring(0, 250) }
+        $ids = [guid[]]@($instances | ForEach-Object { $_.Id })
+
+        $action = 'CREATE'
+        if ($existing.ContainsKey($name)) {
+            $sch = $existing[$name]
+            # Never touch a window that has already started. Changes are not
+            # extended here: an overrunning change is failed, not re-planned.
+            if ([datetime]$sch.ActiveStartTime -le (Get-Date)) {
+                Write-Log "$($chg.Number): window [$name] has already started; left as it is."
+                if ($excludedHere) {
+                    Write-Log "$($chg.Number): window [$name] is running and may still hold $excludedHere excluded machine(s) - end their maintenance mode by hand if so." 'WARN'
+                }
+                $action = 'RUNNING'
+            }
+            elseif (([Math]::Abs(((([datetime]$sch.ActiveStartTime) - $start).TotalSeconds)) -lt 60) -and
+                    ([int]$sch.Duration -eq $mins) -and $sameCis) {
+                $action = 'UNCHANGED'
+            }
+            else { $action = 'AMEND' }
+        }
+
+        if ($DryRun) {
+            Write-Plan $action $name ("{0} for {1} min over {2} CI(s)" -f $start, $mins, $instances.Count)
+        }
+        else {
+            try {
+                switch ($action) {
+                    'CREATE' {
+                        New-SCOMMaintenanceSchedule -Name $name -MonitoringObjects $ids `
+                            -ActiveStartTime $start -Duration $mins -ReasonCode PlannedOther `
+                            -Comments $comment -Recursive -FreqType 1 -TimeZoneId $ChangeTimeZoneId | Out-Null
+                        $created++
+                        Write-Log "$($chg.Number): window [$name] created -> $start for $mins min over $($instances.Count) CI(s)."
+                    }
+                    'AMEND' {
+                        Set-SCOMMaintenanceSchedule -ScheduleId $existing[$name].ScheduleId `
+                            -MonitoringObjects $ids -ActiveStartTime $start -Duration $mins `
+                            -ReasonCode PlannedOther -Comments $comment -Recursive
+                        $amended++
+                        Write-Log "$($chg.Number): window [$name] amended -> $start for $mins min over $($instances.Count) CI(s)."
+                    }
+                    default { $unchanged++ }
+                }
+            } catch {
+                Write-Log "$($chg.Number): could not $action window [$name]: $($_.Exception.Message)" 'ERROR'
+                continue
+            }
+        }
+
+        # A window that was just created or amended no longer covers CIs that
+        # have left the change, so their rows go too - otherwise the shutdown
+        # side would keep treating those machines as hands-off until the old
+        # end time. A RUNNING window was not touched, so its rows stay.
+        if ($action -ne 'RUNNING') {
+            foreach ($k in @($keep.Keys | Where-Object {
+                        $keep[$_].ChangeNumber -eq $chg.Number -and $curIds -notcontains [string]$keep[$_].InstanceId })) {
+                $keep.Remove($k)
+            }
+        }
+
+        # A RUNNING window was not touched, so the rows already held for it are
+        # the record of what it actually covers - leave them exactly as they
+        # are. Rewriting them from the CURRENT CI list used to mark servers added
+        # to the change after it started as hands-off, though SCOM never put them
+        # in the window; and it re-stamped the start as now+2min every pass,
+        # which with ChangeWindowGraceMinutes under 2 made a running window look
+        # as if it had not started, so nothing in it was hands-off at all.
+        if ($action -eq 'RUNNING') {
+            $held = @($keep.Values | Where-Object { $_.ChangeNumber -eq $chg.Number })
+            if ($held.Count -gt 0) {
+                foreach ($r in $held) { $r.MissingSinceUtc = '' }   # it IS in the query this pass
+                continue
+            }
+            # No record at all - state lost, or first run with this window
+            # already going. Best effort: today's CI list, but the schedule's
+            # OWN start and duration rather than recomputed ones.
+            $start = [datetime]$existing[$name].ActiveStartTime
+            $mins  = [int]$existing[$name].Duration
+            Write-Log "$($chg.Number): window [$name] is running with no state held for it; recorded from the schedule's own times." 'WARN'
+        }
+
+        # State rows: what the shutdown side reads to know these are hands-off.
+        foreach ($inst in $instances) {
+            $keep["$($chg.Number)|$($inst.Id)"] = [pscustomobject]@{
+                ChangeNumber = $chg.Number
+                ScheduleName = $name
+                Fqdn         = $inst.DisplayName
+                InstanceId   = [string]$inst.Id
+                StartUtc     = $start.ToUniversalTime().ToString('o')
+                EndUtc       = $start.AddMinutes($mins).ToUniversalTime().ToString('o')
+                WrittenUtc   = $nowUtc.ToString('o')
+                MissingSinceUtc = ''      # present in the query this pass
+            }
+        }
+    }
+
+    # ---- withdraw schedules for changes that are gone ---------------------
+    if ($ChangeReconcile) {
+        foreach ($sch in $existing.Values) {
+            $sname = [string]$sch.ScheduleName
+            if ($sname -notlike "$ChangeSchedulePrefix*") { continue }        # not ours
+            if ($seen.Contains($sname)) { continue }
+            if ([datetime]$sch.ActiveStartTime -le (Get-Date)) { continue }   # running; leave it
+
+            # Only ever withdraw a window this script holds state for. A window
+            # matching the prefix that we have no record of belongs to someone
+            # else, or to a deployment whose state file is gone - either way,
+            # deleting it is not ours to do.
+            $mine = @($keep.Values | Where-Object { $_.ScheduleName -eq $sname })
+            if ($mine.Count -eq 0) {
+                Write-Log "Window [$sname] matches the prefix but this script holds no record of it - left alone." 'WARN'
+                continue
+            }
+
+            # NEVER withdraw on the strength of one absent observation. A failed
+            # query already returned long before here, but data lag and approval
+            # state transitions can also drop a live change for a pass or two.
+            $since = ConvertTo-Utc ([string]$mine[0].MissingSinceUtc)
+            if ($null -eq $since) {
+                foreach ($m in $mine) { $m.MissingSinceUtc = $nowUtc.ToString('o') }
+                Write-Log "Change behind window [$sname] was not returned this pass; watching it for $ChangeWithdrawAfterMinutes min before withdrawing."
+                continue
+            }
+            $missingFor = ($nowUtc - $since).TotalMinutes
+            if ($missingFor -lt $ChangeWithdrawAfterMinutes) {
+                Write-Log ("Change behind window [$sname] still missing after {0:N0} min; will withdraw at {1} min." -f $missingFor, $ChangeWithdrawAfterMinutes)
+                continue
+            }
+
+            if ($DryRun) { Write-Plan 'WITHDRAW' $sname ("missing for {0:N0} min" -f $missingFor); continue }
+            try {
+                Remove-SCOMMaintenanceSchedule -ScheduleId $sch.ScheduleId
+                $removed++
+                Write-Log ("Window [$sname] withdrawn - the change has not been approved and open for {0:N0} min." -f $missingFor) 'WARN'
+                foreach ($k in @($keep.Keys | Where-Object { $keep[$_].ScheduleName -eq $sname })) { $keep.Remove($k) }
+            } catch {
+                Write-Log "Could not withdraw window [$sname]: $($_.Exception.Message)" 'ERROR'
+            }
+        }
+    }
+
+    Set-ChangeWindowRows -Rows @($keep.Values)
+    $script:ChangeMap = $null      # rebuilt on next read
+
+    $script:Stats.ChgCreated += $created
+    $script:Stats.ChgAmended += $amended
+    $script:Stats.ChgRemoved += $removed
+    Write-Log ("CHANGE pass: {0} created, {1} amended, {2} withdrawn, {3} unchanged, {4} machine(s) under a change window." -f
+               $created, $amended, $removed, $unchanged, $keep.Count)
+}
+
+function Test-MgConnection {
+    try {
+        return (@(Get-SCOMManagementGroupConnection -ErrorAction Stop |
+                  Where-Object { $_.IsActive }).Count -gt 0)
+    } catch { return $false }
+}
+
+function Connect-Mg {
+    param([int]$Attempts = 2)
+    for ($a = 1; $a -le $Attempts; $a++) {
+        foreach ($ms in $ManagementServer) {
+            try {
+                New-SCOMManagementGroupConnection -ComputerName $ms -ErrorAction Stop
+                if ($a -gt 1 -or $ms -ne $ManagementServer[0]) {
+                    Write-Log "Connected to the management group via '$ms'." 'WARN'
+                }
+                return $true
+            } catch {
+                Write-Log "Connect to '$ms' failed (attempt $a): $($_.Exception.Message)" 'WARN'
+            }
+        }
+        if ($a -lt $Attempts) { Start-Sleep -Seconds 5 }
+    }
+    return $false
+}
+
+# One iteration, holding the mutex ONLY for the duration of the work.
+#
+# The mutex used to be held for the life of the process. Under the loop that
+# would mean APPLY holding it for four unbroken minutes, so SWEEP could never
+# win it inside its timeout - the sweep would stop running entirely and nothing
+# would ever be released. It must be per-iteration.
+function Invoke-Pass {
+    # CHANGE mode touches neither the tracked state file nor maintenance mode,
+    # so it takes its OWN mutex. Sharing the shutdown one would let a slow SQL
+    # query hold the lock the APPLY loop needs every 60 seconds.
+    $mutexName = if ($Change) { 'Global\ScomChangeMaintenance' } else { 'Global\ScomShutdownMaintenanceMode' }
+    $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+    $held  = $false
+    try {
+        try {
+            $held = $mutex.WaitOne([timespan]::FromSeconds($LockTimeoutSeconds))
+        } catch [System.Threading.AbandonedMutexException] {
+            $held = $true      # previous holder died mid-pass; we own it now
+            Write-Log 'Previous run appears to have died holding the lock.' 'WARN'
+        }
+
+        if (-not $held) {
+            # Under the loop this is cheap - the next attempt is one interval
+            # away, not one task launch away. COUNTED, because an invocation in
+            # which every iteration skipped completed no passes, and that must
+            # not be reported as the same failure as one that could not work.
+            $script:LockSkips++
+            Write-Log "Another pass holds the lock after $LockTimeoutSeconds seconds - skipping this iteration." 'WARN'
+            return
+        }
+
+        if     ($Sweep)  { Invoke-SweepPass }
+        elseif ($Digest) { Invoke-DigestPass }
+        elseif ($Change) { Invoke-ChangePass }
+        else             { Invoke-ApplyPass }
+
+        $script:Stats.Passes++
+
+    } catch {
+        $err = $_
+        Write-Log "Pass failed: $($err.Exception.Message)" 'ERROR'
+
+        # Diagnostics for the 'Argument types do not match' failure. Logged at
+        # WARN deliberately: Write-Log increments $script:Errs on ERROR, and the
+        # closing watchdog event reports that count. One fault stays one error.
+        try {
+            $at    = ($err.InvocationInfo.PositionMessage -split "`r?`n" | ForEach-Object { $_.Trim() }) -join ' | '
+            $stack = ($err.ScriptStackTrace               -split "`r?`n" | ForEach-Object { $_.Trim() }) -join ' | '
+            Write-Log ("Pass failed [type] : {0}" -f $err.Exception.GetType().FullName) 'WARN'
+            Write-Log ("Pass failed [at]   : {0}" -f $at)    'WARN'
+            Write-Log ("Pass failed [stack]: {0}" -f $stack) 'WARN'
+            if ($err.Exception.InnerException) {
+                Write-Log ("Pass failed [inner]: {0}: {1}" -f
+                           $err.Exception.InnerException.GetType().FullName,
+                           $err.Exception.InnerException.Message) 'WARN'
+            }
+        } catch {
+            Write-Log "Could not capture pass failure diagnostics: $($_.Exception.Message)" 'WARN'
+        }
+    } finally {
+        if ($held) { try { $mutex.ReleaseMutex() } catch { } }
+        try { $mutex.Dispose() } catch { }
+    }
+}
+
+$mode = Get-RunMode
+
+if ($DryRun) {
+    $banner = "DRY RUN - $mode. SCOM is queried and agents are probed, but nothing is changed: no maintenance mode, no alert updates, no state files, no mail, and no watchdog event."
+    Write-Output $banner
+    Write-Output ''
+    Write-Log $banner 'WARN'
+}
+
+if (-not (Connect-Mg)) {
+    $msg = "Could not connect to the management group on any of: $($ManagementServer -join ', ')"
+    Write-Log $msg 'ERROR'
+    Write-AppEvent -EventId ((Get-EventBase) + 2) -EntryType 'Error' -Message "${mode}: $msg"
+
+    # Worth an email: the script is doing nothing at all, and if SCOM itself is
+    # the thing that is down, a SCOM alert will not reach anyone either.
+    Send-Notification -Key 'ConnectFailure' -Severity 'ERROR' `
+        -Subject 'Cannot connect to the management group' `
+        -Body ($msg + "`r`n`r`nNo suppression is happening while this persists. Gracefully shut down machines will alert normally.") `
+        -MinIntervalMinutes 60
+    exit 1
+}
+
+$startedUtc = [datetime]::UtcNow
+$iteration  = 0
+
+while ($true) {
+    $passStart = [datetime]::UtcNow
+
+    if (-not (Test-MgConnection)) {
+        Write-Log 'Management group connection is no longer active - reconnecting.' 'WARN'
+        if (-not (Connect-Mg)) {
+            Write-Log 'Reconnect failed - ending this invocation; the task will start a fresh one.' 'ERROR'
+            break
+        }
+    }
+
+    Invoke-Pass
+
+    $elapsed = ([datetime]::UtcNow - $passStart).TotalSeconds
+    Write-Log ('{0} pass {1} finished in {2:N1}s.' -f $mode, ($iteration + 1), $elapsed)
+
+    if ($LoopIntervalSeconds -le 0) { break }   # single-pass mode
+
+    # Anchor iterations to fixed offsets from the start, so a slow pass does not
+    # drift the whole schedule. A pass that overran its slot skips the boundary
+    # it missed rather than running back to back.
+    $iteration++
+    $target = $startedUtc.AddSeconds($iteration * $LoopIntervalSeconds)
+    while ($target -lt [datetime]::UtcNow) {
+        Write-Log ('Pass took {0:N1}s, longer than the {1}s slot - skipping an iteration.' -f
+                   $elapsed, $LoopIntervalSeconds) 'WARN'
+        $iteration++
+        $target = $startedUtc.AddSeconds($iteration * $LoopIntervalSeconds)
+    }
+
+    if (($target - $startedUtc).TotalSeconds -gt $LoopBudgetSeconds) { break }
+
+    # Do not start an iteration we do not expect to FINISH inside the window.
+    # The budget alone only stops us starting past it: a 200-second pass
+    # beginning at T+240 would run to T+440 and overrun the next task launch,
+    # which "do not start a new instance" would then silently suppress. The
+    # previous pass duration is the only estimate available, so use it.
+    $projectedEnd = ($target - $startedUtc).TotalSeconds + $elapsed
+    if ($projectedEnd -gt ($LoopBudgetSeconds + $LoopIntervalSeconds)) {
+        Write-Log ('Ending this invocation early: the last pass took {0:N1}s, so another would finish around {1:N0}s and run past the next scheduled launch.' -f
+                   $elapsed, $projectedEnd) 'WARN'
+        break
+    }
+
+    $sleepMs = [int][Math]::Max(0, ($target - [datetime]::UtcNow).TotalMilliseconds)
+    if ($sleepMs -gt 0) { Start-Sleep -Milliseconds $sleepMs }
+}
+
+$totalSeconds = ([datetime]::UtcNow - $startedUtc).TotalSeconds
+$summary = @(
+    "$mode invocation complete."
+    ("Passes     : {0}" -f $script:Stats.Passes)
+    ("Duration   : {0:N1}s" -f $totalSeconds)
+    ("Tracked    : {0}" -f $script:Stats.Tracked)
+    ("Applied    : {0}" -f $script:Stats.Applied)
+    ("Released   : {0}" -f $script:Stats.Released)
+    ("Extended   : {0}" -f $script:Stats.Extended)
+    ("Reapplied  : {0}" -f $script:Stats.Reapplied)
+    ("MM failures: {0}" -f $script:Stats.MmFailures)
+    ("Orphans    : {0}" -f $script:Stats.Orphans)
+    ("Lock skips : {0}" -f $script:LockSkips)
+    ("Ping-only  : {0}" -f $script:Stats.PingOnly)
+    ("Excluded   : {0}" -f $script:Stats.Excluded)
+    ("Errors     : {0}" -f $script:Errs)
+) -join "`r`n"
+
+if ($Change) {
+    $summary += "`r`n" + (@(
+        ("Chg created: {0}" -f $script:Stats.ChgCreated)
+        ("Chg amended: {0}" -f $script:Stats.ChgAmended)
+        ("Chg removed: {0}" -f $script:Stats.ChgRemoved)
+    ) -join "`r`n")
+}
+
+Write-Log ("{0} invocation complete: {1} pass(es) in {2:N1}s, {3} tracked, {4} error(s)." -f
+           $mode, $script:Stats.Passes, $totalSeconds, $script:Stats.Tracked, $script:Errs)
+
+if ($DryRun) {
+    Write-Output ''
+    Write-Output "DRY RUN complete - nothing was changed. $($script:Errs) error(s); see $LogPath."
+    # Deliberately no watchdog event: the Missing Event monitor fires on their
+    # absence, and a dry run has not done the work that event attests to.
+    exit 0
+}
+
+# THE watchdog signal - see WATCHDOG EVENTS in the header. A Missing Event
+# monitor on x100 OR x101 is the one failure email can never report, because a
+# script that has stopped cannot send it.
+$outcome = Get-RunOutcome -Passes $script:Stats.Passes -Errors $script:Errs -LockSkips $script:LockSkips
+if ($outcome.ExitCode -eq 1) {
+    Write-Log "No pass completed this invocation - reported as did-no-work (event $($outcome.EventId))." 'ERROR'
+    $summary = "$mode did NO work: no pass completed and the lock was never contended, so every pass failed or the mode could not start. See $LogPath.`r`n`r`n" + $summary
+} elseif ($script:Stats.Passes -le 0) {
+    Write-Log ("No pass completed: all {0} iteration(s) deferred to another pass holding the lock. Reported as a warning, not did-no-work." -f $script:LockSkips) 'WARN'
+    $summary = "$mode completed no pass: every iteration ($($script:LockSkips)) deferred to another pass holding the lock. The script is running; the task holding the lock is slow. See $LogPath.`r`n`r`n" + $summary
+} elseif ($outcome.ExitCode -eq 2) {
+    Write-Log "$($script:Errs) error(s) this invocation." 'WARN'
+}
+Write-AppEvent -EventId $outcome.EventId -EntryType $outcome.EntryType -Message $summary
+exit $outcome.ExitCode
