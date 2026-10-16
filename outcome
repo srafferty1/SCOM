@@ -1,0 +1,76 @@
+. Unscoped name lookups, repeated every 60 seconds (most likely)
+
+Get-SCOMClassInstance -Name with no class searches DisplayName across every managed entity in the management group.
+
+In Get-WindowsComputerMap:
+
+powershell
+$found = @(Get-SCOMClassInstance -Name $slice -ErrorAction SilentlyContinue)
+
+In Resolve-WindowsComputer (the per-name fallback):
+
+powershell
+$candidates = @(Get-SCOMClassInstance -Name $Fqdn -ErrorAction SilentlyContinue) |
+              Where-Object { $_.DisplayName -ieq $Fqdn }
+
+Invoke-ApplyPass makes this repeat. Orphan alerts are left open, so the same names are looked up again on every pass for the full 240-minute lookback:
+
+powershell
+$criteria = "Name = '$safeName' AND ResolutionState = 0 AND TimeRaised >= '$stamp'"
+...
+$computer = $computerMap[$fqdn]
+if (-not $computer) {
+    Write-Log "No Windows Computer instance found for '$fqdn' - skipped." 'WARN'
+    $script:Stats.Orphans++
+    ...
+    continue        # alert stays at ResolutionState 0 -> re-queried next pass
+}
+
+Because alerts are sorted oldest-first and capped at MaxBatch, a backlog of orphans fills every batch.
+
+Fix: load the Microsoft.Windows.Computer class instances once per invocation into a hashtable, and cache failed lookups so the same name isn’t searched again for a while.
+
+2. Maintenance-mode churn from restarts
+
+Event 1074 is logged for restarts as well as shutdowns. Every patch reboot therefore gets recursive maintenance mode applied, then released 15 minutes later. Each start and stop writes maintenance-mode history for every hosted object and triggers config recalculation.
+
+In Invoke-MaintenanceMode:
+
+powershell
+Start-SCOMMaintenanceMode -Instance $targets -EndTime $EndUtc.ToLocalTime() `
+    -Reason PlannedOther -Comment $Comment
+
+In Invoke-SweepPass, the release block:
+
+powershell
+$t.Instance.StopMaintenanceMode(
+    $stopUtc,
+    [Microsoft.EnterpriseManagement.Common.TraversalDepth]::Recursive)
+
+Fix: filter the 1074 rule so it only alerts on power-off, not restart.
+
+3. Possible extend loop (rule out)
+
+If the extend can’t be confirmed, EndUtc is never advanced. The machine then gets the batch extend, a per-machine extend and re-reads on every sweep. Unreadable or misread window end times would cause this, for example a UTC+10 timezone mix-up.
+
+In Invoke-SweepPass:
+
+powershell
+$pending = @(Confirm-Extended -Candidates $pending -NewEndUtc $newEnd)
+...
+$t.Instance.UpdateMaintenanceMode($newEnd, ..., [TraversalDepth]::Recursive)
+...
+Write-Log "Extend did not take for $($t.Row.Fqdn) - EndUtc left as-is so the next sweep retries." 'ERROR'
+4. Smaller per-pass costs
+The alert query filters on Name every 60 seconds. Filtering on RuleId would be cheaper.
+GetMaintenanceWindow() is called up to three times per tracked machine per sweep, from Get-MaintenanceOwner and Get-MaintenanceEndUtc.
+Confirming it from the log
+
+Search ScomShutdownMM.log for each message below:
+
+Log message	Points to
+No Windows Computer instance found (high, steady count)	Cause 1
+unhosted-object fallback	Cause 1
+Applied and Released minutes apart (in the events CSV)	Cause 2
+Batch extend confirmed 0 of on every sweep	Cause 3
+Extend did not take on every sweep	Cause 3
